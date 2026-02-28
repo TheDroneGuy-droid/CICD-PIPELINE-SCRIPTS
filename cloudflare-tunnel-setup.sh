@@ -1210,7 +1210,7 @@ EOF
         log "INFO" "Cloudflared service is running"
         
         # Verify tunnel connection by checking logs
-        local tunnel_status=$(sudo journalctl -u cloudflared -n 10 --no-pager 2>/dev/null | grep -iE "registered|connected|serving" | tail -1)
+        local tunnel_status=$(sudo journalctl -u cloudflared -n 10 --no-pager 2>/dev/null | grep -i "registered|connected|serving" | tail -1)
         if [ -n "$tunnel_status" ]; then
             log "INFO" "Tunnel appears to be connected"
         fi
@@ -1407,9 +1407,10 @@ show_menu() {
     echo "5. View available zones"
     echo "6. Restart tunnel service"
     echo "7. Troubleshoot tunnel (diagnose issues)"
-    echo "8. Fix configuration (repair broken setup)"
-    echo "9. View tunnel logs"
-    echo -e "${GREEN}10. Install service with token (auto-start on boot)${NC}"
+    echo "8. Fix configuration (guided repair with prompts)"
+    echo -e "${GREEN}9. Auto Debug (automatic check & fix everything)${NC}"
+    echo "10. View tunnel logs"
+    echo "11. Install service with token (auto-start on boot)"
     echo "0. Exit"
     echo ""
     echo -en "${CYAN}Select option [1]: ${NC}"
@@ -1425,8 +1426,9 @@ show_menu() {
         6) restart_service ;;
         7) troubleshoot_tunnel ;;
         8) fix_configuration ;;
-        9) view_logs ;;
-        10) install_service_with_token ;;
+        9) auto_debug ;;
+        10) view_logs ;;
+        11) install_service_with_token ;;
         0) exit 0 ;;
         *) full_setup ;;
     esac
@@ -1712,6 +1714,619 @@ load_existing_config() {
     # Get tunnel name
     if [ -n "$TUNNEL_ID" ] && command_exists cloudflared; then
         TUNNEL_NAME=$(cloudflared tunnel list 2>/dev/null | grep "$TUNNEL_ID" | awk '{print $2}')
+    fi
+}
+
+#===============================================================================
+# AUTO DEBUG - FULLY AUTOMATIC DIAGNOSTICS AND REPAIR
+#===============================================================================
+
+auto_debug() {
+    print_section "Auto Debug - Automatic Diagnostics & Repair"
+    
+    log "INFO" "Running fully automatic debug with existing parameters..."
+    log "INFO" "No user input required - all fixes applied automatically"
+    echo ""
+    
+    local total_checks=0
+    local passed_checks=0
+    local failed_checks=0
+    local auto_fixed=0
+    local manual_needed=0
+    
+    # Load existing configuration first
+    load_existing_config
+    
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${CYAN}                    STARTING AUTO DEBUG                         ${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    
+    #---------------------------------------------------------------------------
+    # CHECK 1: cloudflared binary
+    #---------------------------------------------------------------------------
+    ((total_checks++))
+    echo -e "${CYAN}[1/12] Checking cloudflared installation...${NC}"
+    if command_exists cloudflared; then
+        local cf_version=$(cloudflared --version 2>/dev/null | head -1)
+        echo -e "   ${GREEN}✓ PASS${NC} - cloudflared installed ($cf_version)"
+        ((passed_checks++))
+    else
+        echo -e "   ${RED}✗ FAIL${NC} - cloudflared not installed"
+        echo -e "   ${YELLOW}→ AUTO-FIX: Installing cloudflared...${NC}"
+        ((failed_checks++))
+        if install_cloudflared; then
+            echo -e "   ${GREEN}✓ FIXED${NC} - cloudflared installed successfully"
+            ((auto_fixed++))
+        else
+            echo -e "   ${RED}✗ FAILED TO FIX${NC} - Manual installation required"
+            ((manual_needed++))
+        fi
+    fi
+    
+    #---------------------------------------------------------------------------
+    # CHECK 2: Cloudflare authentication (cert.pem)
+    #---------------------------------------------------------------------------
+    ((total_checks++))
+    echo -e "${CYAN}[2/12] Checking Cloudflare authentication...${NC}"
+    local cert_found=false
+    local cert_path=""
+    
+    if [ -f "/etc/cloudflared/cert.pem" ]; then
+        cert_found=true
+        cert_path="/etc/cloudflared/cert.pem"
+    elif [ -f "$CF_CONFIG_DIR/cert.pem" ]; then
+        cert_found=true
+        cert_path="$CF_CONFIG_DIR/cert.pem"
+    fi
+    
+    if [ "$cert_found" = true ]; then
+        echo -e "   ${GREEN}✓ PASS${NC} - Authentication certificate found ($cert_path)"
+        ((passed_checks++))
+    else
+        echo -e "   ${RED}✗ FAIL${NC} - Not authenticated with Cloudflare"
+        echo -e "   ${YELLOW}⚠ MANUAL ACTION NEEDED${NC} - Run 'cloudflared tunnel login'"
+        ((failed_checks++))
+        ((manual_needed++))
+    fi
+    
+    #---------------------------------------------------------------------------
+    # CHECK 3: API token exists
+    #---------------------------------------------------------------------------
+    ((total_checks++))
+    echo -e "${CYAN}[3/12] Checking API token existence...${NC}"
+    if [ -n "$CF_API_TOKEN" ] && [ "$CF_API_TOKEN" != "" ]; then
+        echo -e "   ${GREEN}✓ PASS${NC} - API token loaded from config"
+        ((passed_checks++))
+    elif [ -f "$API_TOKEN_FILE" ]; then
+        CF_API_TOKEN=$(cat "$API_TOKEN_FILE")
+        if [ -n "$CF_API_TOKEN" ]; then
+            echo -e "   ${GREEN}✓ PASS${NC} - API token loaded from file"
+            ((passed_checks++))
+        else
+            echo -e "   ${RED}✗ FAIL${NC} - API token file empty"
+            echo -e "   ${YELLOW}⚠ MANUAL ACTION NEEDED${NC} - Configure API token via menu option 1"
+            ((failed_checks++))
+            ((manual_needed++))
+        fi
+    else
+        echo -e "   ${RED}✗ FAIL${NC} - No API token configured"
+        echo -e "   ${YELLOW}⚠ MANUAL ACTION NEEDED${NC} - Configure API token via menu option 1"
+        ((failed_checks++))
+        ((manual_needed++))
+    fi
+    
+    #---------------------------------------------------------------------------
+    # CHECK 4: API token validity
+    #---------------------------------------------------------------------------
+    ((total_checks++))
+    echo -e "${CYAN}[4/12] Validating API token...${NC}"
+    if [ -n "$CF_API_TOKEN" ]; then
+        local token_response=$(curl -s -X GET "$CF_API_URL/user/tokens/verify" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json" 2>/dev/null)
+        
+        if echo "$token_response" | grep -q '"success":true'; then
+            echo -e "   ${GREEN}✓ PASS${NC} - API token is valid"
+            ((passed_checks++))
+        else
+            echo -e "   ${RED}✗ FAIL${NC} - API token is invalid or expired"
+            echo -e "   ${YELLOW}⚠ MANUAL ACTION NEEDED${NC} - Generate new API token at Cloudflare dashboard"
+            ((failed_checks++))
+            ((manual_needed++))
+        fi
+    else
+        echo -e "   ${YELLOW}⊘ SKIP${NC} - No API token to validate"
+    fi
+    
+    #---------------------------------------------------------------------------
+    # CHECK 5: Tunnel ID exists
+    #---------------------------------------------------------------------------
+    ((total_checks++))
+    echo -e "${CYAN}[5/12] Checking tunnel configuration...${NC}"
+    if [ -n "$TUNNEL_ID" ]; then
+        echo -e "   ${GREEN}✓ PASS${NC} - Tunnel ID: $TUNNEL_ID"
+        ((passed_checks++))
+    else
+        # Try to find from config files
+        if [ -f "/etc/cloudflared/config.yml" ]; then
+            TUNNEL_ID=$(grep "^tunnel:" /etc/cloudflared/config.yml 2>/dev/null | awk '{print $2}')
+        fi
+        if [ -f "$CF_CONFIG_FILE" ] && [ -z "$TUNNEL_ID" ]; then
+            TUNNEL_ID=$(grep "^tunnel:" "$CF_CONFIG_FILE" 2>/dev/null | awk '{print $2}')
+        fi
+        
+        if [ -n "$TUNNEL_ID" ]; then
+            echo -e "   ${GREEN}✓ PASS${NC} - Tunnel ID found: $TUNNEL_ID"
+            ((passed_checks++))
+        else
+            echo -e "   ${RED}✗ FAIL${NC} - No tunnel configured in config files"
+            ((failed_checks++))
+            
+            # AUTO-FIX: Try to find existing tunnels
+            if command_exists cloudflared; then
+                echo -e "   ${YELLOW}→ AUTO-FIX: Searching for existing tunnels...${NC}"
+                local existing_tunnels=$(cloudflared tunnel list 2>/dev/null | tail -n +2)
+                
+                if [ -n "$existing_tunnels" ]; then
+                    # Use the first available tunnel
+                    TUNNEL_ID=$(echo "$existing_tunnels" | head -1 | awk '{print $1}')
+                    TUNNEL_NAME=$(echo "$existing_tunnels" | head -1 | awk '{print $2}')
+                    
+                    if [ -n "$TUNNEL_ID" ]; then
+                        echo -e "   ${GREEN}✓ FIXED${NC} - Found existing tunnel: $TUNNEL_NAME ($TUNNEL_ID)"
+                        
+                        # Save tunnel ID to config
+                        if [ -f "$CF_CONFIG_FILE" ]; then
+                            # Update existing config
+                            if grep -q "^tunnel:" "$CF_CONFIG_FILE"; then
+                                sed -i "s/^tunnel:.*/tunnel: $TUNNEL_ID/" "$CF_CONFIG_FILE"
+                            else
+                                sed -i "1i tunnel: $TUNNEL_ID" "$CF_CONFIG_FILE"
+                            fi
+                        fi
+                        ((auto_fixed++))
+                    fi
+                else
+                    # No existing tunnels - create one automatically
+                    echo -e "   ${YELLOW}→ AUTO-FIX: No tunnels found, creating new tunnel...${NC}"
+                    local auto_tunnel_name="auto-tunnel-$(hostname 2>/dev/null || echo 'server')-$(date +%s | tail -c 5)"
+                    
+                    if cloudflared tunnel create "$auto_tunnel_name" 2>/dev/null; then
+                        TUNNEL_ID=$(cloudflared tunnel list 2>/dev/null | grep "$auto_tunnel_name" | awk '{print $1}')
+                        TUNNEL_NAME="$auto_tunnel_name"
+                        
+                        if [ -n "$TUNNEL_ID" ]; then
+                            echo -e "   ${GREEN}✓ FIXED${NC} - Created tunnel: $TUNNEL_NAME ($TUNNEL_ID)"
+                            ((auto_fixed++))
+                        else
+                            echo -e "   ${RED}✗ FAILED TO FIX${NC} - Could not get tunnel ID after creation"
+                            ((manual_needed++))
+                        fi
+                    else
+                        echo -e "   ${RED}✗ FAILED TO FIX${NC} - Could not create tunnel (may need authentication)"
+                        echo -e "   ${YELLOW}⚠ Run: cloudflared tunnel login${NC}"
+                        ((manual_needed++))
+                    fi
+                fi
+            else
+                echo -e "   ${YELLOW}⚠ MANUAL ACTION NEEDED${NC} - cloudflared not installed"
+                ((manual_needed++))
+            fi
+        fi
+    fi
+    
+    #---------------------------------------------------------------------------
+    # CHECK 6: Tunnel exists in Cloudflare
+    #---------------------------------------------------------------------------
+    ((total_checks++))
+    echo -e "${CYAN}[6/12] Verifying tunnel exists in Cloudflare...${NC}"
+    if [ -n "$TUNNEL_ID" ] && command_exists cloudflared; then
+        if cloudflared tunnel info "$TUNNEL_ID" &>/dev/null; then
+            TUNNEL_NAME=$(cloudflared tunnel list 2>/dev/null | grep "$TUNNEL_ID" | awk '{print $2}')
+            echo -e "   ${GREEN}✓ PASS${NC} - Tunnel exists: $TUNNEL_NAME"
+            ((passed_checks++))
+        else
+            echo -e "   ${RED}✗ FAIL${NC} - Tunnel ID not found in Cloudflare account"
+            ((failed_checks++))
+            
+            # AUTO-FIX: Try to select a different existing tunnel
+            echo -e "   ${YELLOW}→ AUTO-FIX: Looking for valid tunnels...${NC}"
+            local valid_tunnels=$(cloudflared tunnel list 2>/dev/null | tail -n +2)
+            
+            if [ -n "$valid_tunnels" ]; then
+                local new_tunnel_id=$(echo "$valid_tunnels" | head -1 | awk '{print $1}')
+                local new_tunnel_name=$(echo "$valid_tunnels" | head -1 | awk '{print $2}')
+                
+                if [ -n "$new_tunnel_id" ] && cloudflared tunnel info "$new_tunnel_id" &>/dev/null; then
+                    TUNNEL_ID="$new_tunnel_id"
+                    TUNNEL_NAME="$new_tunnel_name"
+                    
+                    # Update config files
+                    if [ -f "/etc/cloudflared/config.yml" ]; then
+                        sudo sed -i "s/^tunnel:.*/tunnel: $TUNNEL_ID/" /etc/cloudflared/config.yml
+                    fi
+                    if [ -f "$CF_CONFIG_FILE" ]; then
+                        sed -i "s/^tunnel:.*/tunnel: $TUNNEL_ID/" "$CF_CONFIG_FILE"
+                    fi
+                    
+                    echo -e "   ${GREEN}✓ FIXED${NC} - Switched to valid tunnel: $TUNNEL_NAME ($TUNNEL_ID)"
+                    ((auto_fixed++))
+                else
+                    echo -e "   ${RED}✗ FAILED TO FIX${NC} - No valid tunnels available"
+                    ((manual_needed++))
+                fi
+            else
+                # Create new tunnel
+                echo -e "   ${YELLOW}→ AUTO-FIX: Creating new tunnel...${NC}"
+                local auto_tunnel_name="auto-tunnel-$(hostname 2>/dev/null || echo 'server')-$(date +%s | tail -c 5)"
+                
+                if cloudflared tunnel create "$auto_tunnel_name" 2>/dev/null; then
+                    TUNNEL_ID=$(cloudflared tunnel list 2>/dev/null | grep "$auto_tunnel_name" | awk '{print $1}')
+                    TUNNEL_NAME="$auto_tunnel_name"
+                    
+                    # Update config files
+                    if [ -f "/etc/cloudflared/config.yml" ]; then
+                        sudo sed -i "s/^tunnel:.*/tunnel: $TUNNEL_ID/" /etc/cloudflared/config.yml
+                    fi
+                    if [ -f "$CF_CONFIG_FILE" ]; then
+                        sed -i "s/^tunnel:.*/tunnel: $TUNNEL_ID/" "$CF_CONFIG_FILE"
+                    fi
+                    
+                    echo -e "   ${GREEN}✓ FIXED${NC} - Created new tunnel: $TUNNEL_NAME ($TUNNEL_ID)"
+                    ((auto_fixed++))
+                else
+                    echo -e "   ${RED}✗ FAILED TO FIX${NC} - Could not create tunnel"
+                    ((manual_needed++))
+                fi
+            fi
+        fi
+    else
+        echo -e "   ${YELLOW}⊘ SKIP${NC} - No tunnel ID to verify"
+    fi
+    
+    #---------------------------------------------------------------------------
+    # CHECK 7: Configuration file exists
+    #---------------------------------------------------------------------------
+    ((total_checks++))
+    echo -e "${CYAN}[7/12] Checking configuration file...${NC}"
+    if [ -f "/etc/cloudflared/config.yml" ]; then
+        echo -e "   ${GREEN}✓ PASS${NC} - System config exists (/etc/cloudflared/config.yml)"
+        ((passed_checks++))
+    elif [ -f "$CF_CONFIG_FILE" ]; then
+        echo -e "   ${YELLOW}⚠ WARN${NC} - User config exists but not in system location"
+        echo -e "   ${YELLOW}→ AUTO-FIX: Copying to system location...${NC}"
+        ((failed_checks++))
+        sudo mkdir -p /etc/cloudflared
+        if sudo cp "$CF_CONFIG_FILE" /etc/cloudflared/config.yml; then
+            sudo cp "$CF_CONFIG_DIR"/*.json /etc/cloudflared/ 2>/dev/null || true
+            echo -e "   ${GREEN}✓ FIXED${NC} - Config copied to /etc/cloudflared/"
+            ((auto_fixed++))
+        else
+            echo -e "   ${RED}✗ FAILED TO FIX${NC}"
+            ((manual_needed++))
+        fi
+    else
+        echo -e "   ${RED}✗ FAIL${NC} - No configuration file found"
+        ((failed_checks++))
+        
+        # AUTO-FIX: Generate basic config if we have tunnel ID
+        if [ -n "$TUNNEL_ID" ]; then
+            echo -e "   ${YELLOW}→ AUTO-FIX: Generating basic configuration...${NC}"
+            
+            # Find credentials file
+            local creds_file=""
+            for search_path in "$CF_CONFIG_DIR"/*.json /etc/cloudflared/*.json; do
+                if [ -f "$search_path" ]; then
+                    creds_file="$search_path"
+                    break
+                fi
+            done
+            
+            sudo mkdir -p /etc/cloudflared
+            
+            # Create basic config
+            sudo tee /etc/cloudflared/config.yml > /dev/null << EOCFG
+# Cloudflare Tunnel Configuration
+# Auto-generated by auto_debug
+# Generated: $(date)
+
+tunnel: $TUNNEL_ID
+credentials-file: ${creds_file:-/etc/cloudflared/${TUNNEL_ID}.json}
+
+ingress:
+  # Add your hostname rules here
+  # Example:
+  # - hostname: example.com
+  #   service: http://localhost:80
+  
+  # Catch-all (must be last)
+  - service: http_status:404
+EOCFG
+            
+            if [ -f "/etc/cloudflared/config.yml" ]; then
+                # Copy credentials to system location
+                if [ -n "$creds_file" ] && [ -f "$creds_file" ]; then
+                    sudo cp "$creds_file" /etc/cloudflared/ 2>/dev/null
+                    local creds_filename=$(basename "$creds_file")
+                    sudo sed -i "s|credentials-file:.*|credentials-file: /etc/cloudflared/$creds_filename|g" /etc/cloudflared/config.yml
+                fi
+                echo -e "   ${GREEN}✓ FIXED${NC} - Created basic configuration"
+                echo -e "   ${YELLOW}  Note: Add hostname rules via 'Add domain' (option 2)${NC}"
+                ((auto_fixed++))
+            else
+                echo -e "   ${RED}✗ FAILED TO FIX${NC}"
+                ((manual_needed++))
+            fi
+        else
+            echo -e "   ${YELLOW}⚠ MANUAL ACTION NEEDED${NC} - No tunnel ID available to generate config"
+            ((manual_needed++))
+        fi
+    fi
+    
+    #---------------------------------------------------------------------------
+    # CHECK 8: Credentials file path
+    #---------------------------------------------------------------------------
+    ((total_checks++))
+    echo -e "${CYAN}[8/12] Checking credentials file...${NC}"
+    local config_file="/etc/cloudflared/config.yml"
+    [ ! -f "$config_file" ] && config_file="$CF_CONFIG_FILE"
+    
+    if [ -f "$config_file" ]; then
+        local creds_path=$(grep "credentials-file:" "$config_file" 2>/dev/null | awk '{print $2}')
+        
+        if [ -n "$creds_path" ]; then
+            if [ -f "$creds_path" ]; then
+                echo -e "   ${GREEN}✓ PASS${NC} - Credentials file exists ($creds_path)"
+                ((passed_checks++))
+            else
+                echo -e "   ${RED}✗ FAIL${NC} - Credentials file missing: $creds_path"
+                ((failed_checks++))
+                
+                # Try to find existing credentials
+                local found_creds=""
+                for search_path in /etc/cloudflared/*.json "$CF_CONFIG_DIR"/*.json; do
+                    if [ -f "$search_path" ]; then
+                        found_creds="$search_path"
+                        break
+                    fi
+                done
+                
+                if [ -n "$found_creds" ]; then
+                    echo -e "   ${YELLOW}→ AUTO-FIX: Found credentials at $found_creds${NC}"
+                    local creds_filename=$(basename "$found_creds")
+                    sudo cp "$found_creds" /etc/cloudflared/ 2>/dev/null
+                    sudo sed -i "s|credentials-file:.*|credentials-file: /etc/cloudflared/$creds_filename|g" /etc/cloudflared/config.yml
+                    echo -e "   ${GREEN}✓ FIXED${NC} - Updated credentials path"
+                    ((auto_fixed++))
+                elif [ -n "$TUNNEL_ID" ]; then
+                    # Try to regenerate credentials using tunnel ID
+                    echo -e "   ${YELLOW}→ AUTO-FIX: Attempting to regenerate credentials for tunnel $TUNNEL_ID...${NC}"
+                    local new_creds_file="/etc/cloudflared/${TUNNEL_ID}.json"
+                    
+                    # Check if we can get credentials from cloudflared
+                    if cloudflared tunnel token "$TUNNEL_ID" &>/dev/null; then
+                        # Create a minimal credentials file
+                        local tunnel_token=$(cloudflared tunnel token "$TUNNEL_ID" 2>/dev/null)
+                        if [ -n "$tunnel_token" ]; then
+                            echo -e "   ${GREEN}✓ FIXED${NC} - Use token-based auth instead"
+                            echo -e "   ${YELLOW}  Recommendation: Use 'Install service with token' (option 11)${NC}"
+                            ((auto_fixed++))
+                        fi
+                    else
+                        echo -e "   ${RED}✗ FAILED TO FIX${NC} - Cannot regenerate credentials"
+                        echo -e "   ${YELLOW}⚠ Solution: Delete tunnel and recreate, or use token-based auth${NC}"
+                        ((manual_needed++))
+                    fi
+                else
+                    echo -e "   ${RED}✗ FAILED TO FIX${NC} - No credentials and no tunnel ID"
+                    echo -e "   ${YELLOW}⚠ MANUAL ACTION NEEDED${NC} - Re-authenticate and create tunnel"
+                    ((manual_needed++))
+                fi
+            fi
+        else
+            echo -e "   ${YELLOW}⚠ WARN${NC} - No credentials-file path in config"
+            ((failed_checks++))
+            
+            # AUTO-FIX: Find credentials and add to config
+            local found_creds=""
+            for search_path in /etc/cloudflared/*.json "$CF_CONFIG_DIR"/*.json; do
+                if [ -f "$search_path" ]; then
+                    found_creds="$search_path"
+                    break
+                fi
+            done
+            
+            if [ -n "$found_creds" ]; then
+                echo -e "   ${YELLOW}→ AUTO-FIX: Found credentials at $found_creds${NC}"
+                local creds_filename=$(basename "$found_creds")
+                sudo cp "$found_creds" /etc/cloudflared/ 2>/dev/null
+                
+                # Add credentials-file line to config after tunnel line
+                if [ -f "/etc/cloudflared/config.yml" ]; then
+                    sudo sed -i "/^tunnel:/a credentials-file: /etc/cloudflared/$creds_filename" /etc/cloudflared/config.yml
+                    echo -e "   ${GREEN}✓ FIXED${NC} - Added credentials path to config"
+                    ((auto_fixed++))
+                fi
+            else
+                echo -e "   ${YELLOW}⚠ MANUAL ACTION NEEDED${NC} - No credentials file found"
+                ((manual_needed++))
+            fi
+        fi
+    else
+        echo -e "   ${YELLOW}⊘ SKIP${NC} - No config file to check"
+    fi
+    
+    #---------------------------------------------------------------------------
+    # CHECK 9: Config syntax validation
+    #---------------------------------------------------------------------------
+    ((total_checks++))
+    echo -e "${CYAN}[9/12] Validating configuration syntax...${NC}"
+    if [ -f "/etc/cloudflared/config.yml" ] && command_exists cloudflared; then
+        if cloudflared tunnel ingress validate --config /etc/cloudflared/config.yml &>/dev/null; then
+            echo -e "   ${GREEN}✓ PASS${NC} - Configuration syntax is valid"
+            ((passed_checks++))
+        else
+            echo -e "   ${RED}✗ FAIL${NC} - Configuration syntax error"
+            echo -e "   ${YELLOW}⚠ MANUAL ACTION NEEDED${NC} - Review config: cat /etc/cloudflared/config.yml"
+            cloudflared tunnel ingress validate --config /etc/cloudflared/config.yml 2>&1 | head -5
+            ((failed_checks++))
+            ((manual_needed++))
+        fi
+    else
+        echo -e "   ${YELLOW}⊘ SKIP${NC} - No config to validate"
+    fi
+    
+    #---------------------------------------------------------------------------
+    # CHECK 10: Systemd service installed
+    #---------------------------------------------------------------------------
+    ((total_checks++))
+    echo -e "${CYAN}[10/12] Checking systemd service...${NC}"
+    if systemctl list-unit-files 2>/dev/null | grep -q cloudflared; then
+        echo -e "   ${GREEN}✓ PASS${NC} - Service unit file exists"
+        ((passed_checks++))
+    else
+        echo -e "   ${RED}✗ FAIL${NC} - Service not installed"
+        echo -e "   ${YELLOW}→ AUTO-FIX: Installing service...${NC}"
+        ((failed_checks++))
+        
+        if [ -f "/etc/cloudflared/config.yml" ]; then
+            if sudo cloudflared service install 2>/dev/null; then
+                echo -e "   ${GREEN}✓ FIXED${NC} - Service installed"
+                ((auto_fixed++))
+            else
+                # Manual systemd service creation
+                local cf_path=$(which cloudflared 2>/dev/null || echo "/usr/local/bin/cloudflared")
+                sudo tee /etc/systemd/system/cloudflared.service > /dev/null << EOSVC
+[Unit]
+Description=Cloudflare Tunnel
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=$cf_path --config /etc/cloudflared/config.yml tunnel run
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOSVC
+                sudo systemctl daemon-reload
+                echo -e "   ${GREEN}✓ FIXED${NC} - Service created manually"
+                ((auto_fixed++))
+            fi
+        else
+            echo -e "   ${RED}✗ FAILED TO FIX${NC} - No config file available"
+            ((manual_needed++))
+        fi
+    fi
+    
+    #---------------------------------------------------------------------------
+    # CHECK 11: Service enabled
+    #---------------------------------------------------------------------------
+    ((total_checks++))
+    echo -e "${CYAN}[11/12] Checking service is enabled...${NC}"
+    if systemctl list-unit-files 2>/dev/null | grep -q cloudflared; then
+        if sudo systemctl is-enabled --quiet cloudflared 2>/dev/null; then
+            echo -e "   ${GREEN}✓ PASS${NC} - Service is enabled (auto-start on boot)"
+            ((passed_checks++))
+        else
+            echo -e "   ${YELLOW}⚠ WARN${NC} - Service not enabled"
+            echo -e "   ${YELLOW}→ AUTO-FIX: Enabling service...${NC}"
+            ((failed_checks++))
+            if sudo systemctl enable cloudflared 2>/dev/null; then
+                echo -e "   ${GREEN}✓ FIXED${NC} - Service enabled"
+                ((auto_fixed++))
+            else
+                echo -e "   ${RED}✗ FAILED TO FIX${NC}"
+                ((manual_needed++))
+            fi
+        fi
+    else
+        echo -e "   ${YELLOW}⊘ SKIP${NC} - Service not installed"
+    fi
+    
+    #---------------------------------------------------------------------------
+    # CHECK 12: Service running
+    #---------------------------------------------------------------------------
+    ((total_checks++))
+    echo -e "${CYAN}[12/12] Checking service is running...${NC}"
+    if sudo systemctl is-active --quiet cloudflared 2>/dev/null; then
+        echo -e "   ${GREEN}✓ PASS${NC} - Service is running"
+        ((passed_checks++))
+        
+        # Additional: Check tunnel connection in logs
+        local recent_log=$(sudo journalctl -u cloudflared -n 5 --no-pager 2>/dev/null | grep -iE "registered|connected|serving" | tail -1)
+        if [ -n "$recent_log" ]; then
+            echo -e "   ${GREEN}✓ BONUS${NC} - Tunnel appears connected"
+        fi
+    else
+        echo -e "   ${RED}✗ FAIL${NC} - Service is not running"
+        ((failed_checks++))
+        
+        # Check if we have all prerequisites to start
+        if [ -f "/etc/cloudflared/config.yml" ] && systemctl list-unit-files 2>/dev/null | grep -q cloudflared; then
+            echo -e "   ${YELLOW}→ AUTO-FIX: Starting service...${NC}"
+            sudo systemctl daemon-reload
+            if sudo systemctl start cloudflared; then
+                sleep 3
+                if sudo systemctl is-active --quiet cloudflared; then
+                    echo -e "   ${GREEN}✓ FIXED${NC} - Service started successfully"
+                    ((auto_fixed++))
+                else
+                    echo -e "   ${RED}✗ FAILED TO FIX${NC} - Service won't stay running"
+                    echo -e "   Recent logs:"
+                    sudo journalctl -u cloudflared -n 5 --no-pager 2>/dev/null | tail -3
+                    ((manual_needed++))
+                fi
+            else
+                echo -e "   ${RED}✗ FAILED TO FIX${NC} - Could not start service"
+                ((manual_needed++))
+            fi
+        else
+            echo -e "   ${YELLOW}⚠ MANUAL ACTION NEEDED${NC} - Prerequisites missing"
+            ((manual_needed++))
+        fi
+    fi
+    
+    #---------------------------------------------------------------------------
+    # SUMMARY
+    #---------------------------------------------------------------------------
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${CYAN}                    AUTO DEBUG SUMMARY                          ${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "Total Checks:      ${CYAN}$total_checks${NC}"
+    echo -e "Passed:            ${GREEN}$passed_checks${NC}"
+    echo -e "Failed:            ${RED}$failed_checks${NC}"
+    echo -e "Auto-Fixed:        ${GREEN}$auto_fixed${NC}"
+    echo -e "Manual Action:     ${YELLOW}$manual_needed${NC}"
+    echo ""
+    
+    if [ $manual_needed -eq 0 ] && [ $failed_checks -eq 0 ]; then
+        echo -e "${GREEN}════════════════════════════════════════════════════════════════${NC}"
+        echo -e "${GREEN}  ✓ ALL CHECKS PASSED - TUNNEL IS HEALTHY                       ${NC}"
+        echo -e "${GREEN}════════════════════════════════════════════════════════════════${NC}"
+    elif [ $manual_needed -eq 0 ] && [ $auto_fixed -gt 0 ]; then
+        echo -e "${GREEN}════════════════════════════════════════════════════════════════${NC}"
+        echo -e "${GREEN}  ✓ ALL ISSUES AUTO-FIXED - TUNNEL SHOULD BE WORKING            ${NC}"
+        echo -e "${GREEN}════════════════════════════════════════════════════════════════${NC}"
+    else
+        echo -e "${YELLOW}════════════════════════════════════════════════════════════════${NC}"
+        echo -e "${YELLOW}  ⚠ MANUAL ACTION REQUIRED FOR $manual_needed ISSUE(S)                       ${NC}"
+        echo -e "${YELLOW}════════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        echo -e "${CYAN}Recommended next steps:${NC}"
+        echo "  1. Run full setup (option 1) to configure from scratch"
+        echo "  2. Or use 'Fix configuration' (option 8) for guided repair"
+    fi
+    
+    echo ""
+    if confirm "Return to menu?"; then
+        show_menu
     fi
 }
 
