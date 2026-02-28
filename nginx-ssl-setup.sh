@@ -76,6 +76,70 @@ get_server_ip() {
     echo "$ip"
 }
 
+retry_command() {
+    local max_attempts=${1:-3}
+    local delay=${2:-5}
+    shift 2
+    local cmd="$@"
+    local attempt=1
+    
+    while [ $attempt -le $max_attempts ]; do
+        log "INFO" "Attempt $attempt of $max_attempts: $cmd"
+        if eval "$cmd"; then
+            return 0
+        fi
+        log "WARN" "Command failed, retrying in ${delay}s..."
+        sleep $delay
+        ((attempt++))
+    done
+    
+    log "ERROR" "Command failed after $max_attempts attempts"
+    return 1
+}
+
+#===============================================================================
+# LOAD EXISTING CONFIGURATION
+#===============================================================================
+
+load_existing_config() {
+    # Load from main-server-setup config
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+        log "DEBUG" "Loaded app config: $APP_NAME on port $APP_PORT"
+    fi
+    
+    # Load from nginx config if exists
+    local nginx_config=$(ls /etc/nginx/sites-available/* 2>/dev/null | grep -v default | head -1)
+    if [ -n "$nginx_config" ] && [ -f "$nginx_config" ]; then
+        # Extract domain from nginx config
+        local found_domain=$(grep "server_name" "$nginx_config" 2>/dev/null | head -1 | awk '{print $2}' | tr -d ';')
+        if [ -n "$found_domain" ] && [ "$found_domain" != "_" ]; then
+            EXISTING_DOMAIN="$found_domain"
+            log "DEBUG" "Found existing domain: $EXISTING_DOMAIN"
+        fi
+        
+        # Extract port from proxy_pass
+        local found_port=$(grep "proxy_pass" "$nginx_config" 2>/dev/null | head -1 | grep -oE ':[0-9]+' | head -1 | tr -d ':')
+        if [ -n "$found_port" ]; then
+            EXISTING_PORT="$found_port"
+            log "DEBUG" "Found existing port: $EXISTING_PORT"
+        fi
+        
+        # Extract app name from config file
+        EXISTING_APP_NAME=$(basename "$nginx_config")
+        log "DEBUG" "Found existing app: $EXISTING_APP_NAME"
+    fi
+    
+    # Detect SSL method
+    if [ -d "/etc/letsencrypt/live" ] && ls /etc/letsencrypt/live/*/fullchain.pem &>/dev/null; then
+        EXISTING_SSL="letsencrypt"
+    elif ls /etc/nginx/ssl/*.crt &>/dev/null; then
+        EXISTING_SSL="selfsigned"
+    else
+        EXISTING_SSL="http"
+    fi
+}
+
 #===============================================================================
 # INPUT COLLECTION
 #===============================================================================
@@ -84,34 +148,54 @@ collect_inputs() {
     print_section "Configuration Setup"
     
     # Load existing config if available
+    load_existing_config
+    
     if [ -f "$CONFIG_FILE" ]; then
         log "INFO" "Loading configuration from main-server-setup..."
         source "$CONFIG_FILE"
         log "INFO" "Loaded: APP_NAME=$APP_NAME, APP_PORT=$APP_PORT"
     fi
     
-    # Domain name
-    echo -en "${CYAN}Enter your domain name (e.g., example.com): ${NC}"
-    read -r DOMAIN_NAME
-    while [ -z "$DOMAIN_NAME" ]; do
-        echo -e "${RED}Domain name is required!${NC}"
-        echo -en "${CYAN}Enter your domain name: ${NC}"
+    # Domain name - use existing if available
+    if [ -n "$EXISTING_DOMAIN" ]; then
+        echo -en "${CYAN}Enter your domain name [${EXISTING_DOMAIN}]: ${NC}"
         read -r DOMAIN_NAME
-    done
-    
-    # App name if not loaded
-    if [ -z "$APP_NAME" ]; then
-        local default_name=$(basename "$PARENT_DIR" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')
-        echo -en "${CYAN}Enter application name [${default_name}]: ${NC}"
-        read -r APP_NAME
-        APP_NAME=${APP_NAME:-$default_name}
+        DOMAIN_NAME=${DOMAIN_NAME:-$EXISTING_DOMAIN}
+    else
+        echo -en "${CYAN}Enter your domain name (e.g., example.com): ${NC}"
+        read -r DOMAIN_NAME
+        while [ -z "$DOMAIN_NAME" ]; do
+            echo -e "${RED}Domain name is required!${NC}"
+            echo -en "${CYAN}Enter your domain name: ${NC}"
+            read -r DOMAIN_NAME
+        done
     fi
     
-    # App port if not loaded
+    # App name if not loaded - use existing if available
+    if [ -z "$APP_NAME" ]; then
+        if [ -n "$EXISTING_APP_NAME" ]; then
+            echo -en "${CYAN}Enter application name [${EXISTING_APP_NAME}]: ${NC}"
+            read -r APP_NAME
+            APP_NAME=${APP_NAME:-$EXISTING_APP_NAME}
+        else
+            local default_name=$(basename "$PARENT_DIR" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')
+            echo -en "${CYAN}Enter application name [${default_name}]: ${NC}"
+            read -r APP_NAME
+            APP_NAME=${APP_NAME:-$default_name}
+        fi
+    fi
+    
+    # App port if not loaded - use existing if available
     if [ -z "$APP_PORT" ] || [ "$APP_PORT" = "3000" ]; then
-        echo -en "${CYAN}Enter application port [3000]: ${NC}"
-        read -r input_port
-        APP_PORT=${input_port:-3000}
+        if [ -n "$EXISTING_PORT" ]; then
+            echo -en "${CYAN}Enter application port [${EXISTING_PORT}]: ${NC}"
+            read -r input_port
+            APP_PORT=${input_port:-$EXISTING_PORT}
+        else
+            echo -en "${CYAN}Enter application port [3000]: ${NC}"
+            read -r input_port
+            APP_PORT=${input_port:-3000}
+        fi
     fi
     
     # SSL setup method
@@ -710,22 +794,332 @@ display_summary() {
 }
 
 #===============================================================================
-# MAIN EXECUTION
+# FIX NGINX CONFIGURATION
 #===============================================================================
 
-main() {
-    print_section "Nginx & SSL Setup Script"
-    echo "This script will configure:"
-    echo "  - Nginx reverse proxy"
-    echo "  - SSL certificate (optional)"
-    echo "  - Security headers"
-    echo "  - Gzip compression"
+fix_nginx_config() {
+    print_section "Fix Nginx Configuration - Automatic Repair"
+    
+    local issues_found=0
+    local issues_fixed=0
+    
+    log "INFO" "Scanning for configuration issues..."
+    load_existing_config
     echo ""
     
-    if ! confirm "Continue with setup?"; then
-        exit 0
+    # 1. Check nginx installation
+    echo -e "${CYAN}1. Checking Nginx installation...${NC}"
+    if ! command_exists nginx; then
+        echo -e "   ${RED}✗ Nginx not installed${NC}"
+        ((issues_found++))
+        if confirm "   Install Nginx?"; then
+            install_nginx
+            ((issues_fixed++))
+        fi
+    else
+        echo -e "   ${GREEN}✓ Nginx installed: $(nginx -v 2>&1 | cut -d'/' -f2)${NC}"
     fi
     
+    # 2. Check nginx service
+    echo -e "${CYAN}2. Checking Nginx service...${NC}"
+    if sudo systemctl is-active --quiet nginx 2>/dev/null; then
+        echo -e "   ${GREEN}✓ Nginx is running${NC}"
+    else
+        echo -e "   ${RED}✗ Nginx not running${NC}"
+        ((issues_found++))
+        if confirm "   Start Nginx?"; then
+            sudo systemctl start nginx
+            if sudo systemctl is-active --quiet nginx; then
+                echo -e "   ${GREEN}✓ Nginx started${NC}"
+                ((issues_fixed++))
+            else
+                echo -e "   ${RED}Failed to start Nginx${NC}"
+                sudo journalctl -u nginx -n 10 --no-pager
+            fi
+        fi
+    fi
+    
+    # 3. Check nginx configuration
+    echo -e "${CYAN}3. Checking Nginx configuration syntax...${NC}"
+    if sudo nginx -t 2>/dev/null; then
+        echo -e "   ${GREEN}✓ Configuration syntax OK${NC}"
+    else
+        echo -e "   ${RED}✗ Configuration syntax error${NC}"
+        ((issues_found++))
+        sudo nginx -t 2>&1 | head -5
+        
+        if confirm "   Try to fix configuration?"; then
+            # Backup and recreate
+            local config_file="/etc/nginx/sites-available/$EXISTING_APP_NAME"
+            if [ -f "$config_file" ]; then
+                sudo cp "$config_file" "${config_file}.broken.$(date +%s)"
+                log "INFO" "Backed up broken config"
+            fi
+            
+            if [ -n "$EXISTING_DOMAIN" ] && [ -n "$EXISTING_PORT" ]; then
+                DOMAIN_NAME="$EXISTING_DOMAIN"
+                APP_PORT="$EXISTING_PORT"
+                APP_NAME="$EXISTING_APP_NAME"
+                
+                case $EXISTING_SSL in
+                    letsencrypt) configure_nginx_letsencrypt ;;
+                    selfsigned) configure_nginx_selfsigned ;;
+                    *) configure_nginx_http ;;
+                esac
+                ((issues_fixed++))
+            else
+                echo -e "   ${YELLOW}Cannot auto-fix - need domain and port info${NC}"
+            fi
+        fi
+    fi
+    
+    # 4. Check site is enabled
+    echo -e "${CYAN}4. Checking site configuration...${NC}"
+    local enabled_sites=$(ls /etc/nginx/sites-enabled/ 2>/dev/null | grep -v default | wc -l)
+    if [ "$enabled_sites" -gt 0 ]; then
+        echo -e "   ${GREEN}✓ Found $enabled_sites enabled site(s)${NC}"
+        ls /etc/nginx/sites-enabled/ | grep -v default | while read site; do
+            echo -e "      - $site"
+        done
+    else
+        echo -e "   ${YELLOW}⚠ No custom sites enabled${NC}"
+        ((issues_found++))
+        
+        local available_sites=$(ls /etc/nginx/sites-available/ 2>/dev/null | grep -v default | head -1)
+        if [ -n "$available_sites" ]; then
+            if confirm "   Enable $available_sites?"; then
+                sudo ln -sf "/etc/nginx/sites-available/$available_sites" "/etc/nginx/sites-enabled/"
+                sudo nginx -t && sudo systemctl reload nginx
+                ((issues_fixed++))
+            fi
+        fi
+    fi
+    
+    # 5. Check application connectivity
+    echo -e "${CYAN}5. Checking backend application...${NC}"
+    local test_port="${EXISTING_PORT:-3000}"
+    if curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$test_port" 2>/dev/null | grep -qE "200|301|302"; then
+        echo -e "   ${GREEN}✓ Application responding on port $test_port${NC}"
+    else
+        echo -e "   ${YELLOW}⚠ Application not responding on port $test_port${NC}"
+        ((issues_found++))
+        echo -e "   ${YELLOW}   Check if your application is running (pm2 status, docker ps, etc.)${NC}"
+    fi
+    
+    # 6. Check SSL certificates
+    echo -e "${CYAN}6. Checking SSL certificates...${NC}"
+    case $EXISTING_SSL in
+        letsencrypt)
+            if [ -d "/etc/letsencrypt/live" ]; then
+                local cert_domain=$(ls /etc/letsencrypt/live/ | head -1)
+                if [ -n "$cert_domain" ]; then
+                    local cert_file="/etc/letsencrypt/live/$cert_domain/fullchain.pem"
+                    if [ -f "$cert_file" ]; then
+                        local expiry=$(openssl x509 -enddate -noout -in "$cert_file" 2>/dev/null | cut -d= -f2)
+                        local expiry_epoch=$(date -d "$expiry" +%s 2>/dev/null)
+                        local now_epoch=$(date +%s)
+                        local days_left=$(( (expiry_epoch - now_epoch) / 86400 ))
+                        
+                        if [ "$days_left" -gt 30 ]; then
+                            echo -e "   ${GREEN}✓ Let's Encrypt cert valid ($days_left days left)${NC}"
+                        elif [ "$days_left" -gt 0 ]; then
+                            echo -e "   ${YELLOW}⚠ Let's Encrypt cert expiring soon ($days_left days left)${NC}"
+                            ((issues_found++))
+                            if confirm "   Renew certificate?"; then
+                                sudo certbot renew --force-renewal
+                                ((issues_fixed++))
+                            fi
+                        else
+                            echo -e "   ${RED}✗ Let's Encrypt cert expired${NC}"
+                            ((issues_found++))
+                            if confirm "   Renew certificate?"; then
+                                sudo certbot renew --force-renewal
+                                ((issues_fixed++))
+                            fi
+                        fi
+                    fi
+                fi
+            fi
+            ;;
+        selfsigned)
+            echo -e "   ${GREEN}✓ Using self-signed certificate${NC}"
+            ;;
+        *)
+            echo -e "   ${YELLOW}⚠ No SSL configured (HTTP only)${NC}"
+            ;;
+    esac
+    
+    # 7. Check firewall
+    echo -e "${CYAN}7. Checking firewall...${NC}"
+    if command_exists ufw; then
+        if sudo ufw status | grep -q "80\|443"; then
+            echo -e "   ${GREEN}✓ Firewall allows HTTP/HTTPS${NC}"
+        else
+            echo -e "   ${YELLOW}⚠ Firewall may be blocking HTTP/HTTPS${NC}"
+            ((issues_found++))
+            if confirm "   Allow HTTP/HTTPS in firewall?"; then
+                sudo ufw allow 'Nginx Full' || {
+                    sudo ufw allow 80/tcp
+                    sudo ufw allow 443/tcp
+                }
+                ((issues_fixed++))
+            fi
+        fi
+    else
+        echo -e "   ${YELLOW}⚠ UFW not installed (firewall status unknown)${NC}"
+    fi
+    
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    if [ $issues_found -eq 0 ]; then
+        log "INFO" "No issues found! Nginx configuration appears healthy."
+    else
+        log "INFO" "Found $issues_found issue(s), fixed $issues_fixed"
+        
+        if [ $issues_fixed -gt 0 ]; then
+            echo ""
+            if confirm "Reload Nginx to apply changes?"; then
+                if sudo nginx -t; then
+                    sudo systemctl reload nginx
+                    log "INFO" "Nginx reloaded successfully"
+                else
+                    log "ERROR" "Nginx config test failed"
+                fi
+            fi
+        fi
+    fi
+    
+    echo ""
+    if confirm "Return to menu?"; then
+        show_menu
+    fi
+}
+
+#===============================================================================
+# VIEW CONFIGURATION
+#===============================================================================
+
+view_nginx_config() {
+    print_section "Current Nginx Configuration"
+    
+    load_existing_config
+    
+    echo -e "${CYAN}Enabled Sites:${NC}"
+    ls -la /etc/nginx/sites-enabled/ 2>/dev/null | tail -n +2
+    echo ""
+    
+    if [ -n "$EXISTING_APP_NAME" ]; then
+        echo -e "${CYAN}Configuration for $EXISTING_APP_NAME:${NC}"
+        echo "═══════════════════════════════════════════════════════════════"
+        sudo cat "/etc/nginx/sites-available/$EXISTING_APP_NAME" 2>/dev/null || echo "File not found"
+    fi
+    
+    echo ""
+    if confirm "Return to menu?"; then
+        show_menu
+    fi
+}
+
+#===============================================================================
+# RESTART NGINX
+#===============================================================================
+
+restart_nginx() {
+    print_section "Restart Nginx"
+    
+    log "INFO" "Testing configuration..."
+    if sudo nginx -t; then
+        log "INFO" "Configuration OK, restarting..."
+        sudo systemctl restart nginx
+        
+        sleep 2
+        if sudo systemctl is-active --quiet nginx; then
+            log "INFO" "Nginx restarted successfully"
+            sudo systemctl status nginx --no-pager | head -10
+        else
+            log "ERROR" "Nginx failed to restart"
+            sudo journalctl -u nginx -n 15 --no-pager
+        fi
+    else
+        log "ERROR" "Configuration test failed"
+    fi
+    
+    echo ""
+    if confirm "Return to menu?"; then
+        show_menu
+    fi
+}
+
+#===============================================================================
+# VIEW LOGS
+#===============================================================================
+
+view_nginx_logs() {
+    echo ""
+    echo -e "${CYAN}Select log to view:${NC}"
+    echo "1. Error log"
+    echo "2. Access log"
+    echo "3. Both (combined)"
+    echo ""
+    echo -en "${CYAN}Select [1]: ${NC}"
+    read -r log_choice
+    log_choice=${log_choice:-1}
+    
+    echo "Press Ctrl+C to stop viewing logs"
+    sleep 2
+    
+    case $log_choice in
+        1) sudo tail -f /var/log/nginx/error.log ;;
+        2) sudo tail -f /var/log/nginx/access.log ;;
+        3) sudo tail -f /var/log/nginx/error.log /var/log/nginx/access.log ;;
+    esac
+}
+
+#===============================================================================
+# MENU
+#===============================================================================
+
+show_menu() {
+    print_section "Nginx & SSL Setup"
+    
+    load_existing_config
+    
+    # Show current status
+    if [ -n "$EXISTING_DOMAIN" ]; then
+        echo -e "${GREEN}Detected configuration:${NC}"
+        echo -e "  Domain: $EXISTING_DOMAIN"
+        echo -e "  App: $EXISTING_APP_NAME (port $EXISTING_PORT)"
+        echo -e "  SSL: $EXISTING_SSL"
+        echo ""
+    fi
+    
+    echo "What would you like to do?"
+    echo ""
+    echo "1. Full setup (new installation)"
+    echo "2. Reconfigure existing site"
+    echo "3. View current configuration"
+    echo "4. Fix configuration (repair broken setup)"
+    echo "5. Restart Nginx"
+    echo "6. View logs"
+    echo "7. Exit"
+    echo ""
+    echo -en "${CYAN}Select option [1]: ${NC}"
+    read -r menu_choice
+    menu_choice=${menu_choice:-1}
+    
+    case $menu_choice in
+        1) full_setup ;;
+        2) reconfigure_site ;;
+        3) view_nginx_config ;;
+        4) fix_nginx_config ;;
+        5) restart_nginx ;;
+        6) view_nginx_logs ;;
+        7) exit 0 ;;
+        *) full_setup ;;
+    esac
+}
+
+full_setup() {
     collect_inputs
     install_nginx
     
@@ -738,6 +1132,43 @@ main() {
     
     verify_setup
     display_summary
+}
+
+reconfigure_site() {
+    # Use existing values as defaults
+    if [ -n "$EXISTING_DOMAIN" ]; then
+        DOMAIN_NAME="$EXISTING_DOMAIN"
+        APP_NAME="$EXISTING_APP_NAME"
+        APP_PORT="$EXISTING_PORT"
+    fi
+    
+    collect_inputs
+    
+    case $SSL_METHOD in
+        1) configure_nginx_http ;;
+        2) configure_nginx_letsencrypt ;;
+        3) configure_nginx_selfsigned ;;
+        *) configure_nginx_http ;;
+    esac
+    
+    verify_setup
+    display_summary
+}
+
+#===============================================================================
+# MAIN EXECUTION
+#===============================================================================
+
+main() {
+    print_section "Nginx & SSL Setup Script"
+    echo "This script will configure:"
+    echo "  - Nginx reverse proxy"
+    echo "  - SSL certificate (optional)"
+    echo "  - Security headers"
+    echo "  - Gzip compression"
+    echo ""
+    
+    show_menu
 }
 
 main "$@"

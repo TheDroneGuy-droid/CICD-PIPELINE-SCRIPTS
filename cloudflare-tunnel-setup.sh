@@ -33,7 +33,7 @@ API_TOKEN_FILE="$CF_CONFIG_DIR/api_token"
 
 # Cloudflare API
 CF_API_URL="https://api.cloudflare.com/client/v4"
-CF_API_TOKEN="5SmpLIr6eL_EkeZy3ouR_C4Sv9GMcSFlTV92p-wa"
+CF_API_TOKEN=""  # Will be loaded from file or prompted from user
 
 #===============================================================================
 # HELPER FUNCTIONS
@@ -582,6 +582,13 @@ configure_service() {
     fi
     log "INFO" "Zone ID: $ZONE_ID"
     
+    # Save zone info for later use
+    ZONE_NAME="$ROOT_DOMAIN"
+    cat > "$CF_CONFIG_DIR/zone_info" << EOF
+ZONE_ID=$ZONE_ID
+ZONE_NAME=$ROOT_DOMAIN
+EOF
+    
     # Ask hosting type: main domain or subdomain
     echo ""
     echo -e "${YELLOW}Hosting Type:${NC}"
@@ -996,6 +1003,138 @@ validate_config() {
 # SERVICE INSTALLATION
 #===============================================================================
 
+# Install service using Cloudflare Dashboard token (simplest method)
+install_service_with_token() {
+    print_section "Install Service with Token"
+    
+    log "INFO" "This method uses a tunnel token from Cloudflare Dashboard"
+    log "INFO" "The token contains all configuration needed to run the tunnel"
+    echo ""
+    
+    # Check if service already exists
+    if systemctl is-active --quiet cloudflared 2>/dev/null; then
+        log "WARN" "Cloudflared service is already running"
+        echo ""
+        sudo systemctl status cloudflared --no-pager | head -10
+        echo ""
+        
+        if confirm "Stop and reinstall service with new token?"; then
+            log "INFO" "Stopping existing service..."
+            sudo systemctl stop cloudflared
+            sudo systemctl disable cloudflared 2>/dev/null || true
+            sudo cloudflared service uninstall 2>/dev/null || true
+            sleep 2
+        else
+            log "INFO" "Keeping existing service"
+            return 0
+        fi
+    fi
+    
+    # Get token from user
+    echo -e "${CYAN}Get your tunnel token from Cloudflare Dashboard:${NC}"
+    echo "  1. Go to: https://one.dash.cloudflare.com/"
+    echo "  2. Navigate to: Networks → Tunnels"
+    echo "  3. Select your tunnel → Configure"
+    echo "  4. Copy the token from the 'Install connector' section"
+    echo ""
+    echo -en "${CYAN}Paste your tunnel token: ${NC}"
+    read -r TUNNEL_TOKEN
+    
+    if [ -z "$TUNNEL_TOKEN" ]; then
+        log "ERROR" "No token provided"
+        return 1
+    fi
+    
+    # Validate token format (base64 encoded JSON)
+    if ! echo "$TUNNEL_TOKEN" | base64 -d 2>/dev/null | grep -q '"a"'; then
+        log "WARN" "Token doesn't appear to be in expected format, but will try anyway"
+    fi
+    
+    log "INFO" "Installing cloudflared service with token..."
+    
+    # Install service using token
+    if sudo cloudflared service install "$TUNNEL_TOKEN"; then
+        log "INFO" "Service installed successfully"
+    else
+        log "WARN" "cloudflared service install failed, creating systemd service manually..."
+        
+        # Get cloudflared path
+        local cf_path=$(which cloudflared)
+        if [ -z "$cf_path" ]; then
+            cf_path="/usr/local/bin/cloudflared"
+        fi
+        
+        # Create systemd service manually with token
+        sudo tee /etc/systemd/system/cloudflared.service > /dev/null << EOF
+[Unit]
+Description=Cloudflare Tunnel
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=${cf_path} tunnel run --token ${TUNNEL_TOKEN}
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        log "INFO" "Created systemd service file"
+    fi
+    
+    # Reload systemd and enable service
+    sudo systemctl daemon-reload
+    sudo systemctl enable cloudflared
+    
+    # Start service
+    log "INFO" "Starting cloudflared service..."
+    sudo systemctl start cloudflared
+    
+    # Wait for connection
+    log "INFO" "Waiting for tunnel to establish connection..."
+    sleep 5
+    
+    # Check status
+    if sudo systemctl is-active --quiet cloudflared; then
+        log "INFO" "Cloudflared service is running!"
+        echo ""
+        sudo systemctl status cloudflared --no-pager | head -15
+        echo ""
+        
+        # Show recent logs
+        log "INFO" "Recent tunnel logs:"
+        sudo journalctl -u cloudflared -n 10 --no-pager 2>/dev/null | tail -5
+        echo ""
+        
+        echo -e "${GREEN}════════════════════════════════════════════════════════════════${NC}"
+        echo -e "${GREEN}  TUNNEL SERVICE INSTALLED SUCCESSFULLY${NC}"
+        echo -e "${GREEN}════════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        echo -e "${CYAN}Useful commands:${NC}"
+        echo "  Check status:  sudo systemctl status cloudflared"
+        echo "  View logs:     sudo journalctl -u cloudflared -f"
+        echo "  Restart:       sudo systemctl restart cloudflared"
+        echo "  Stop:          sudo systemctl stop cloudflared"
+        echo ""
+        echo -e "${CYAN}The tunnel will now:${NC}"
+        echo "  ✓ Start automatically on boot"
+        echo "  ✓ Restart automatically if it crashes"
+        echo "  ✓ Run in the background as a system service"
+        echo ""
+    else
+        log "ERROR" "Service failed to start"
+        echo ""
+        sudo systemctl status cloudflared --no-pager
+        echo ""
+        log "INFO" "Recent logs:"
+        sudo journalctl -u cloudflared -n 20 --no-pager
+        return 1
+    fi
+}
+
 install_service() {
     print_section "Installing as System Service"
     
@@ -1071,7 +1210,7 @@ EOF
         log "INFO" "Cloudflared service is running"
         
         # Verify tunnel connection by checking logs
-        local tunnel_status=$(sudo journalctl -u cloudflared -n 10 --no-pager 2>/dev/null | grep -i "registered|connected|serving" | tail -1)
+        local tunnel_status=$(sudo journalctl -u cloudflared -n 10 --no-pager 2>/dev/null | grep -iE "registered|connected|serving" | tail -1)
         if [ -n "$tunnel_status" ]; then
             log "INFO" "Tunnel appears to be connected"
         fi
@@ -1256,6 +1395,9 @@ display_summary() {
 show_menu() {
     print_section "Cloudflare Tunnel Setup"
     
+    # Load existing config if available
+    load_existing_config
+    
     echo "What would you like to do?"
     echo ""
     echo "1. Full setup (new installation)"
@@ -1265,8 +1407,10 @@ show_menu() {
     echo "5. View available zones"
     echo "6. Restart tunnel service"
     echo "7. Troubleshoot tunnel (diagnose issues)"
-    echo "8. View tunnel logs"
-    echo "9. Exit"
+    echo "8. Fix configuration (repair broken setup)"
+    echo "9. View tunnel logs"
+    echo -e "${GREEN}10. Install service with token (auto-start on boot)${NC}"
+    echo "0. Exit"
     echo ""
     echo -en "${CYAN}Select option [1]: ${NC}"
     read -r menu_choice
@@ -1280,8 +1424,10 @@ show_menu() {
         5) view_zones ;;
         6) restart_service ;;
         7) troubleshoot_tunnel ;;
-        8) view_logs ;;
-        9) exit 0 ;;
+        8) fix_configuration ;;
+        9) view_logs ;;
+        10) install_service_with_token ;;
+        0) exit 0 ;;
         *) full_setup ;;
     esac
 }
@@ -1535,6 +1681,276 @@ troubleshoot_tunnel() {
         if confirm "Return to menu?"; then
             show_menu
         fi
+    fi
+}
+
+#===============================================================================
+# LOAD EXISTING CONFIGURATION
+#===============================================================================
+
+load_existing_config() {
+    # Load from system config if available
+    if [ -f "/etc/cloudflared/config.yml" ]; then
+        TUNNEL_ID=$(grep "^tunnel:" /etc/cloudflared/config.yml 2>/dev/null | awk '{print $2}')
+        if [ -n "$TUNNEL_ID" ]; then
+            log "DEBUG" "Loaded existing tunnel ID: $TUNNEL_ID"
+        fi
+    fi
+    
+    # Load API token if saved
+    if [ -f "$API_TOKEN_FILE" ]; then
+        CF_API_TOKEN=$(cat "$API_TOKEN_FILE")
+        log "DEBUG" "Loaded API token from file"
+    fi
+    
+    # Load zone info if available
+    if [ -f "$CF_CONFIG_DIR/zone_info" ]; then
+        source "$CF_CONFIG_DIR/zone_info"
+        log "DEBUG" "Loaded zone info: $ZONE_ID ($ZONE_NAME)"
+    fi
+    
+    # Get tunnel name
+    if [ -n "$TUNNEL_ID" ] && command_exists cloudflared; then
+        TUNNEL_NAME=$(cloudflared tunnel list 2>/dev/null | grep "$TUNNEL_ID" | awk '{print $2}')
+    fi
+}
+
+#===============================================================================
+# FIX CONFIGURATION
+#===============================================================================
+
+fix_configuration() {
+    print_section "Fix Configuration - Automatic Repair"
+    
+    local issues_found=0
+    local issues_fixed=0
+    
+    log "INFO" "Scanning for configuration issues..."
+    echo ""
+    
+    # 1. Check cloudflared installation
+    echo -e "${CYAN}1. Checking cloudflared installation...${NC}"
+    if ! command_exists cloudflared; then
+        echo -e "   ${RED}✗ cloudflared not installed${NC}"
+        ((issues_found++))
+        if confirm "   Install cloudflared?"; then
+            install_cloudflared
+            ((issues_fixed++))
+        fi
+    else
+        echo -e "   ${GREEN}✓ cloudflared installed${NC}"
+    fi
+    
+    # 2. Check authentication
+    echo -e "${CYAN}2. Checking Cloudflare authentication...${NC}"
+    if [ ! -f "$CF_CONFIG_DIR/cert.pem" ] && [ ! -f "/etc/cloudflared/cert.pem" ]; then
+        echo -e "   ${RED}✗ Not authenticated${NC}"
+        ((issues_found++))
+        if confirm "   Authenticate with Cloudflare?"; then
+            authenticate_cloudflare
+            ((issues_fixed++))
+        fi
+    else
+        echo -e "   ${GREEN}✓ Authenticated${NC}"
+    fi
+    
+    # 3. Check API token
+    echo -e "${CYAN}3. Checking API token...${NC}"
+    if [ -z "$CF_API_TOKEN" ] || [ "$CF_API_TOKEN" = "" ]; then
+        echo -e "   ${RED}✗ API token not configured${NC}"
+        ((issues_found++))
+        if confirm "   Configure API token?"; then
+            setup_api_token
+            ((issues_fixed++))
+        fi
+    else
+        # Validate token
+        local token_test=$(curl -s -X GET "$CF_API_URL/user/tokens/verify" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json" 2>/dev/null | grep -o '"success":true')
+        if [ -n "$token_test" ]; then
+            echo -e "   ${GREEN}✓ API token valid${NC}"
+        else
+            echo -e "   ${YELLOW}⚠ API token may be invalid${NC}"
+            ((issues_found++))
+            if confirm "   Re-configure API token?"; then
+                setup_api_token
+                ((issues_fixed++))
+            fi
+        fi
+    fi
+    
+    # 4. Check tunnel exists
+    echo -e "${CYAN}4. Checking tunnel configuration...${NC}"
+    if [ -z "$TUNNEL_ID" ]; then
+        echo -e "   ${RED}✗ No tunnel configured${NC}"
+        ((issues_found++))
+        if confirm "   Create or select a tunnel?"; then
+            select_or_create_tunnel
+            ((issues_fixed++))
+        fi
+    else
+        # Verify tunnel exists in Cloudflare
+        if cloudflared tunnel info "$TUNNEL_ID" &>/dev/null; then
+            echo -e "   ${GREEN}✓ Tunnel exists: ${TUNNEL_ID}${NC}"
+        else
+            echo -e "   ${RED}✗ Tunnel not found in Cloudflare${NC}"
+            ((issues_found++))
+            if confirm "   Create new tunnel?"; then
+                select_or_create_tunnel
+                ((issues_fixed++))
+            fi
+        fi
+    fi
+    
+    # 5. Check config file
+    echo -e "${CYAN}5. Checking configuration file...${NC}"
+    if [ ! -f "/etc/cloudflared/config.yml" ]; then
+        echo -e "   ${RED}✗ System config missing${NC}"
+        ((issues_found++))
+        if [ -f "$CF_CONFIG_FILE" ]; then
+            echo -e "   Found user config at $CF_CONFIG_FILE"
+            if confirm "   Copy to system location?"; then
+                sudo mkdir -p /etc/cloudflared
+                sudo cp "$CF_CONFIG_FILE" /etc/cloudflared/config.yml
+                sudo cp "$CF_CONFIG_DIR"/*.json /etc/cloudflared/ 2>/dev/null || true
+                ((issues_fixed++))
+            fi
+        else
+            if confirm "   Generate new configuration?"; then
+                configure_service
+                generate_config
+                install_service
+                ((issues_fixed++))
+            fi
+        fi
+    else
+        echo -e "   ${GREEN}✓ Configuration file exists${NC}"
+    fi
+    
+    # 6. Check credentials file path
+    echo -e "${CYAN}6. Checking credentials file path...${NC}"
+    local creds_path=$(grep "credentials-file:" /etc/cloudflared/config.yml 2>/dev/null | awk '{print $2}')
+    if [ -n "$creds_path" ]; then
+        if [ -f "$creds_path" ]; then
+            echo -e "   ${GREEN}✓ Credentials file exists at $creds_path${NC}"
+        else
+            echo -e "   ${RED}✗ Credentials file missing: $creds_path${NC}"
+            ((issues_found++))
+            
+            # Look for credentials file
+            local found_creds=$(ls /etc/cloudflared/*.json 2>/dev/null | head -1)
+            if [ -z "$found_creds" ]; then
+                found_creds=$(ls "$CF_CONFIG_DIR"/*.json 2>/dev/null | head -1)
+            fi
+            
+            if [ -n "$found_creds" ]; then
+                echo -e "   Found credentials at: $found_creds"
+                if confirm "   Update config to use this file?"; then
+                    local creds_filename=$(basename "$found_creds")
+                    sudo cp "$found_creds" /etc/cloudflared/ 2>/dev/null || true
+                    sudo sed -i "s|credentials-file:.*|credentials-file: /etc/cloudflared/$creds_filename|g" /etc/cloudflared/config.yml
+                    echo -e "   ${GREEN}✓ Updated credentials path${NC}"
+                    ((issues_fixed++))
+                fi
+            else
+                echo -e "   ${RED}No credentials file found. Need to re-authenticate.${NC}"
+                if confirm "   Re-authenticate?"; then
+                    authenticate_cloudflare
+                    select_or_create_tunnel
+                    ((issues_fixed++))
+                fi
+            fi
+        fi
+    fi
+    
+    # 7. Check systemd service
+    echo -e "${CYAN}7. Checking systemd service...${NC}"
+    if systemctl list-unit-files | grep -q cloudflared; then
+        if sudo systemctl is-enabled --quiet cloudflared 2>/dev/null; then
+            echo -e "   ${GREEN}✓ Service enabled${NC}"
+        else
+            echo -e "   ${YELLOW}⚠ Service not enabled${NC}"
+            ((issues_found++))
+            if confirm "   Enable service?"; then
+                sudo systemctl enable cloudflared
+                ((issues_fixed++))
+            fi
+        fi
+        
+        if sudo systemctl is-active --quiet cloudflared 2>/dev/null; then
+            echo -e "   ${GREEN}✓ Service running${NC}"
+        else
+            echo -e "   ${RED}✗ Service not running${NC}"
+            ((issues_found++))
+            if confirm "   Start service?"; then
+                sudo systemctl start cloudflared
+                sleep 3
+                if sudo systemctl is-active --quiet cloudflared; then
+                    echo -e "   ${GREEN}✓ Service started${NC}"
+                    ((issues_fixed++))
+                else
+                    echo -e "   ${RED}Service failed to start${NC}"
+                    sudo journalctl -u cloudflared -n 10 --no-pager
+                fi
+            fi
+        fi
+    else
+        echo -e "   ${RED}✗ Service not installed${NC}"
+        ((issues_found++))
+        if confirm "   Install service?"; then
+            install_service
+            ((issues_fixed++))
+        fi
+    fi
+    
+    # 8. Check DNS records
+    echo -e "${CYAN}8. Checking DNS records...${NC}"
+    if [ -n "$ZONE_ID" ] && [ -n "$TUNNEL_ID" ]; then
+        local tunnel_target="${TUNNEL_ID}.cfargotunnel.com"
+        echo -e "   Expected CNAME target: $tunnel_target"
+        
+        # List existing records
+        local existing_records=$(curl -s -X GET "$CF_API_URL/zones/$ZONE_ID/dns_records?type=CNAME" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json" 2>/dev/null)
+        
+        local tunnel_records=$(echo "$existing_records" | grep -o "\"content\":\"${TUNNEL_ID}.cfargotunnel.com\"" | wc -l)
+        if [ "$tunnel_records" -gt 0 ]; then
+            echo -e "   ${GREEN}✓ Found $tunnel_records DNS record(s) pointing to tunnel${NC}"
+        else
+            echo -e "   ${YELLOW}⚠ No DNS records found for this tunnel${NC}"
+            echo -e "   ${YELLOW}  Run 'Manage DNS records' to set up DNS${NC}"
+        fi
+    else
+        echo -e "   ${YELLOW}⚠ Cannot check DNS - Zone ID or Tunnel ID missing${NC}"
+    fi
+    
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    if [ $issues_found -eq 0 ]; then
+        log "INFO" "No issues found! Configuration appears healthy."
+    else
+        log "INFO" "Found $issues_found issue(s), fixed $issues_fixed"
+        
+        if [ $issues_fixed -gt 0 ]; then
+            echo ""
+            if confirm "Restart cloudflared service to apply changes?"; then
+                sudo systemctl restart cloudflared
+                sleep 3
+                if sudo systemctl is-active --quiet cloudflared; then
+                    log "INFO" "Service restarted successfully"
+                else
+                    log "ERROR" "Service failed to restart"
+                    sudo journalctl -u cloudflared -n 10 --no-pager
+                fi
+            fi
+        fi
+    fi
+    
+    echo ""
+    if confirm "Return to menu?"; then
+        show_menu
     fi
 }
 
