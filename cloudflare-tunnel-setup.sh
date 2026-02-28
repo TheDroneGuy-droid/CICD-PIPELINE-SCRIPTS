@@ -1020,6 +1020,13 @@ install_service() {
     sudo cp "$CF_CONFIG_DIR"/*.json /etc/cloudflared/ 2>/dev/null || true
     sudo cp "$CF_CONFIG_DIR/cert.pem" /etc/cloudflared/ 2>/dev/null || true
     
+    # Fix credentials-file path in system config to point to /etc/cloudflared
+    local creds_filename=$(ls "$CF_CONFIG_DIR"/*.json 2>/dev/null | head -1 | xargs basename)
+    if [ -n "$creds_filename" ]; then
+        sudo sed -i "s|credentials-file:.*|credentials-file: /etc/cloudflared/$creds_filename|g" /etc/cloudflared/config.yml
+        log "INFO" "Updated credentials path to /etc/cloudflared/$creds_filename"
+    fi
+    
     # Install service
     log "INFO" "Installing cloudflared service..."
     
@@ -1057,13 +1064,28 @@ EOF
     sudo systemctl enable cloudflared
     sudo systemctl start cloudflared
     
-    sleep 3
+    log "INFO" "Waiting for tunnel to establish connection..."
+    sleep 5
     
     if sudo systemctl is-active --quiet cloudflared; then
         log "INFO" "Cloudflared service is running"
+        
+        # Verify tunnel connection by checking logs
+        local tunnel_status=$(sudo journalctl -u cloudflared -n 10 --no-pager 2>/dev/null | grep -i "registered|connected|serving" | tail -1)
+        if [ -n "$tunnel_status" ]; then
+            log "INFO" "Tunnel appears to be connected"
+        fi
+        
+        # Show service status
+        sudo systemctl status cloudflared --no-pager | head -15
     else
         log "ERROR" "Service failed to start"
-        sudo systemctl status cloudflared
+        sudo systemctl status cloudflared --no-pager
+        echo ""
+        log "INFO" "Recent logs:"
+        sudo journalctl -u cloudflared -n 20 --no-pager
+        echo ""
+        log "INFO" "Try running 'troubleshoot_tunnel' from menu to diagnose"
         exit 1
     fi
 }
@@ -1242,8 +1264,9 @@ show_menu() {
     echo "4. Manage DNS records"
     echo "5. View available zones"
     echo "6. Restart tunnel service"
-    echo "7. View tunnel logs"
-    echo "8. Exit"
+    echo "7. Troubleshoot tunnel (diagnose issues)"
+    echo "8. View tunnel logs"
+    echo "9. Exit"
     echo ""
     echo -en "${CYAN}Select option [1]: ${NC}"
     read -r menu_choice
@@ -1256,8 +1279,9 @@ show_menu() {
         4) manage_dns ;;
         5) view_zones ;;
         6) restart_service ;;
-        7) view_logs ;;
-        8) exit 0 ;;
+        7) troubleshoot_tunnel ;;
+        8) view_logs ;;
+        9) exit 0 ;;
         *) full_setup ;;
     esac
 }
@@ -1412,11 +1436,105 @@ view_config() {
 }
 
 restart_service() {
-    sudo systemctl restart cloudflared
-    sudo systemctl status cloudflared
+    print_section "Restarting Cloudflare Tunnel Service"
+    
+    log "INFO" "Stopping service..."
+    sudo systemctl stop cloudflared 2>/dev/null || true
+    
+    log "INFO" "Starting service..."
+    sudo systemctl start cloudflared
+    
+    sleep 3
+    
+    if sudo systemctl is-active --quiet cloudflared; then
+        log "INFO" "Service is running successfully"
+        sudo systemctl status cloudflared --no-pager
+    else
+        log "ERROR" "Service failed to start"
+        sudo systemctl status cloudflared --no-pager
+        echo ""
+        log "INFO" "Showing recent logs:"
+        sudo journalctl -u cloudflared -n 20 --no-pager
+    fi
     
     if confirm "Return to menu?"; then
         show_menu
+    fi
+}
+
+troubleshoot_tunnel() {
+    print_section "Tunnel Troubleshooting"
+    
+    echo -e "${CYAN}1. Service Status${NC}"
+    echo "==================="
+    if sudo systemctl is-active --quiet cloudflared; then
+        echo -e "   Status: ${GREEN}RUNNING${NC}"
+    else
+        echo -e "   Status: ${RED}STOPPED${NC}"
+    fi
+    sudo systemctl is-enabled cloudflared 2>/dev/null && echo -e "   Enabled: ${GREEN}YES${NC}" || echo -e "   Enabled: ${RED}NO${NC}"
+    echo ""
+    
+    echo -e "${CYAN}2. Configuration Check${NC}"
+    echo "======================="
+    if [ -f /etc/cloudflared/config.yml ]; then
+        echo -e "   Config file: ${GREEN}EXISTS${NC} (/etc/cloudflared/config.yml)"
+        
+        # Check credentials file path in config
+        local creds_path=$(grep "credentials-file:" /etc/cloudflared/config.yml | awk '{print $2}')
+        if [ -n "$creds_path" ]; then
+            if [ -f "$creds_path" ]; then
+                echo -e "   Credentials: ${GREEN}EXISTS${NC} ($creds_path)"
+            else
+                echo -e "   Credentials: ${RED}MISSING${NC} ($creds_path)"
+                echo -e "   ${YELLOW}FIX: Credentials file not found. Re-run full setup.${NC}"
+            fi
+        fi
+        
+        # Check tunnel ID
+        local tunnel_id=$(grep "tunnel:" /etc/cloudflared/config.yml | awk '{print $2}')
+        if [ -n "$tunnel_id" ]; then
+            echo -e "   Tunnel ID: ${GREEN}$tunnel_id${NC}"
+        else
+            echo -e "   Tunnel ID: ${RED}NOT SET${NC}"
+        fi
+    else
+        echo -e "   Config file: ${RED}MISSING${NC}"
+        echo -e "   ${YELLOW}FIX: Run full setup to create configuration.${NC}"
+    fi
+    echo ""
+    
+    echo -e "${CYAN}3. Tunnel Connectivity${NC}"
+    echo "======================="
+    local tunnel_id=$(grep "tunnel:" /etc/cloudflared/config.yml 2>/dev/null | awk '{print $2}')
+    if [ -n "$tunnel_id" ]; then
+        if cloudflared tunnel info "$tunnel_id" 2>/dev/null | head -5; then
+            echo -e "   ${GREEN}Tunnel info retrieved successfully${NC}"
+        else
+            echo -e "   ${YELLOW}Could not get tunnel info (may need auth)${NC}"
+        fi
+    fi
+    echo ""
+    
+    echo -e "${CYAN}4. Recent Logs${NC}"
+    echo "==============="
+    sudo journalctl -u cloudflared -n 15 --no-pager 2>/dev/null || echo "No logs available"
+    echo ""
+    
+    echo -e "${CYAN}5. Quick Fixes${NC}"
+    echo "==============="
+    echo "  a) Restart service: sudo systemctl restart cloudflared"
+    echo "  b) View full logs: sudo journalctl -u cloudflared -f"
+    echo "  c) Re-run setup: Select option 1 from menu"
+    echo "  d) Check DNS: Ensure CNAME records point to <tunnel-id>.cfargotunnel.com"
+    echo ""
+    
+    if confirm "Attempt automatic fix (restart service)?"; then
+        restart_service
+    else
+        if confirm "Return to menu?"; then
+            show_menu
+        fi
     fi
 }
 
