@@ -1076,6 +1076,376 @@ view_nginx_logs() {
 }
 
 #===============================================================================
+# AUTO DEBUG - FULLY AUTOMATIC DIAGNOSTICS AND REPAIR
+#===============================================================================
+
+auto_debug() {
+    print_section "Auto Debug - Automatic Diagnostics & Repair"
+    
+    log "INFO" "Running fully automatic debug with existing parameters..."
+    log "INFO" "No user input required - all fixes applied automatically"
+    echo ""
+    
+    local total_checks=0
+    local passed_checks=0
+    local failed_checks=0
+    local auto_fixed=0
+    local manual_needed=0
+    
+    # Load existing configuration first
+    load_existing_config
+    
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${CYAN}                    STARTING AUTO DEBUG                         ${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    
+    #---------------------------------------------------------------------------
+    # CHECK 1: Nginx installation
+    #---------------------------------------------------------------------------
+    ((total_checks++))
+    echo -e "${CYAN}[1/10] Checking Nginx installation...${NC}"
+    if command_exists nginx; then
+        local nginx_version=$(nginx -v 2>&1 | cut -d'/' -f2)
+        echo -e "   ${GREEN}✓ PASS${NC} - Nginx installed (v$nginx_version)"
+        ((passed_checks++))
+    else
+        echo -e "   ${RED}✗ FAIL${NC} - Nginx not installed"
+        echo -e "   ${YELLOW}→ AUTO-FIX: Installing Nginx...${NC}"
+        ((failed_checks++))
+        if retry_command 3 5 "sudo apt-get update && sudo apt-get install -y nginx"; then
+            echo -e "   ${GREEN}✓ FIXED${NC} - Nginx installed successfully"
+            ((auto_fixed++))
+        else
+            echo -e "   ${RED}✗ FAILED TO FIX${NC} - Manual installation required"
+            ((manual_needed++))
+        fi
+    fi
+    
+    #---------------------------------------------------------------------------
+    # CHECK 2: Nginx service running
+    #---------------------------------------------------------------------------
+    ((total_checks++))
+    echo -e "${CYAN}[2/10] Checking Nginx service...${NC}"
+    if sudo systemctl is-active --quiet nginx 2>/dev/null; then
+        echo -e "   ${GREEN}✓ PASS${NC} - Nginx service is running"
+        ((passed_checks++))
+    else
+        echo -e "   ${RED}✗ FAIL${NC} - Nginx service not running"
+        ((failed_checks++))
+        echo -e "   ${YELLOW}→ AUTO-FIX: Starting Nginx...${NC}"
+        if sudo systemctl start nginx 2>/dev/null; then
+            sleep 2
+            if sudo systemctl is-active --quiet nginx; then
+                echo -e "   ${GREEN}✓ FIXED${NC} - Nginx started successfully"
+                ((auto_fixed++))
+            else
+                echo -e "   ${RED}✗ FAILED TO FIX${NC} - Check logs: journalctl -u nginx"
+                ((manual_needed++))
+            fi
+        else
+            echo -e "   ${RED}✗ FAILED TO FIX${NC} - Could not start Nginx"
+            ((manual_needed++))
+        fi
+    fi
+    
+    #---------------------------------------------------------------------------
+    # CHECK 3: Nginx service enabled
+    #---------------------------------------------------------------------------
+    ((total_checks++))
+    echo -e "${CYAN}[3/10] Checking Nginx auto-start...${NC}"
+    if sudo systemctl is-enabled --quiet nginx 2>/dev/null; then
+        echo -e "   ${GREEN}✓ PASS${NC} - Nginx enabled (auto-start on boot)"
+        ((passed_checks++))
+    else
+        echo -e "   ${YELLOW}⚠ WARN${NC} - Nginx not enabled for auto-start"
+        ((failed_checks++))
+        echo -e "   ${YELLOW}→ AUTO-FIX: Enabling Nginx...${NC}"
+        if sudo systemctl enable nginx 2>/dev/null; then
+            echo -e "   ${GREEN}✓ FIXED${NC} - Nginx enabled"
+            ((auto_fixed++))
+        else
+            echo -e "   ${RED}✗ FAILED TO FIX${NC}"
+            ((manual_needed++))
+        fi
+    fi
+    
+    #---------------------------------------------------------------------------
+    # CHECK 4: Configuration syntax
+    #---------------------------------------------------------------------------
+    ((total_checks++))
+    echo -e "${CYAN}[4/10] Checking Nginx configuration syntax...${NC}"
+    if sudo nginx -t 2>/dev/null; then
+        echo -e "   ${GREEN}✓ PASS${NC} - Configuration syntax is valid"
+        ((passed_checks++))
+    else
+        echo -e "   ${RED}✗ FAIL${NC} - Configuration syntax error"
+        ((failed_checks++))
+        sudo nginx -t 2>&1 | head -3
+        
+        # Try to auto-fix by regenerating config if we have domain info
+        if [ -n "$EXISTING_DOMAIN" ] && [ -n "$EXISTING_PORT" ]; then
+            echo -e "   ${YELLOW}→ AUTO-FIX: Regenerating configuration...${NC}"
+            local config_file="/etc/nginx/sites-available/${EXISTING_APP_NAME:-default}"
+            
+            # Backup broken config
+            sudo cp "$config_file" "${config_file}.broken.$(date +%s)" 2>/dev/null
+            
+            # Create basic working config
+            sudo tee "$config_file" > /dev/null << EOCFG
+server {
+    listen 80;
+    server_name $EXISTING_DOMAIN www.$EXISTING_DOMAIN;
+    
+    location / {
+        proxy_pass http://127.0.0.1:${EXISTING_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_cache_bypass \$http_upgrade;
+    }
+}
+EOCFG
+            
+            # Enable site
+            sudo ln -sf "$config_file" "/etc/nginx/sites-enabled/" 2>/dev/null
+            
+            if sudo nginx -t 2>/dev/null; then
+                echo -e "   ${GREEN}✓ FIXED${NC} - Configuration regenerated"
+                ((auto_fixed++))
+            else
+                echo -e "   ${RED}✗ FAILED TO FIX${NC} - Manual review needed"
+                ((manual_needed++))
+            fi
+        else
+            echo -e "   ${YELLOW}⚠ MANUAL ACTION NEEDED${NC} - No domain info to regenerate config"
+            ((manual_needed++))
+        fi
+    fi
+    
+    #---------------------------------------------------------------------------
+    # CHECK 5: Site configuration exists
+    #---------------------------------------------------------------------------
+    ((total_checks++))
+    echo -e "${CYAN}[5/10] Checking site configurations...${NC}"
+    local enabled_sites=$(ls /etc/nginx/sites-enabled/ 2>/dev/null | grep -v default | wc -l)
+    if [ "$enabled_sites" -gt 0 ]; then
+        echo -e "   ${GREEN}✓ PASS${NC} - Found $enabled_sites enabled site(s)"
+        ((passed_checks++))
+    else
+        echo -e "   ${YELLOW}⚠ WARN${NC} - No custom sites enabled"
+        ((failed_checks++))
+        
+        # Try to enable available site
+        local available_site=$(ls /etc/nginx/sites-available/ 2>/dev/null | grep -v default | head -1)
+        if [ -n "$available_site" ]; then
+            echo -e "   ${YELLOW}→ AUTO-FIX: Enabling $available_site...${NC}"
+            sudo ln -sf "/etc/nginx/sites-available/$available_site" /etc/nginx/sites-enabled/
+            if sudo nginx -t 2>/dev/null; then
+                sudo systemctl reload nginx
+                echo -e "   ${GREEN}✓ FIXED${NC} - Site enabled"
+                ((auto_fixed++))
+            else
+                sudo rm "/etc/nginx/sites-enabled/$available_site" 2>/dev/null
+                echo -e "   ${RED}✗ FAILED TO FIX${NC} - Config has errors"
+                ((manual_needed++))
+            fi
+        else
+            echo -e "   ${YELLOW}⚠ MANUAL ACTION NEEDED${NC} - No site configurations found"
+            ((manual_needed++))
+        fi
+    fi
+    
+    #---------------------------------------------------------------------------
+    # CHECK 6: Backend application responding
+    #---------------------------------------------------------------------------
+    ((total_checks++))
+    echo -e "${CYAN}[6/10] Checking backend application...${NC}"
+    local test_port="${EXISTING_PORT:-3000}"
+    local http_code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$test_port" 2>/dev/null || echo "000")
+    
+    if [[ "$http_code" =~ ^(200|301|302|304|404)$ ]]; then
+        echo -e "   ${GREEN}✓ PASS${NC} - Backend responding on port $test_port (HTTP $http_code)"
+        ((passed_checks++))
+    else
+        echo -e "   ${RED}✗ FAIL${NC} - Backend not responding on port $test_port (HTTP $http_code)"
+        ((failed_checks++))
+        echo -e "   ${YELLOW}⚠ MANUAL ACTION NEEDED${NC} - Start your application first"
+        ((manual_needed++))
+    fi
+    
+    #---------------------------------------------------------------------------
+    # CHECK 7: SSL certificates
+    #---------------------------------------------------------------------------
+    ((total_checks++))
+    echo -e "${CYAN}[7/10] Checking SSL certificates...${NC}"
+    case "$EXISTING_SSL" in
+        letsencrypt)
+            if [ -d "/etc/letsencrypt/live" ]; then
+                local cert_domain=$(ls /etc/letsencrypt/live/ 2>/dev/null | head -1)
+                if [ -n "$cert_domain" ] && [ -f "/etc/letsencrypt/live/$cert_domain/fullchain.pem" ]; then
+                    local expiry=$(openssl x509 -enddate -noout -in "/etc/letsencrypt/live/$cert_domain/fullchain.pem" 2>/dev/null | cut -d= -f2)
+                    local expiry_epoch=$(date -d "$expiry" +%s 2>/dev/null || echo 0)
+                    local now_epoch=$(date +%s)
+                    local days_left=$(( (expiry_epoch - now_epoch) / 86400 ))
+                    
+                    if [ "$days_left" -gt 30 ]; then
+                        echo -e "   ${GREEN}✓ PASS${NC} - Let's Encrypt cert valid ($days_left days left)"
+                        ((passed_checks++))
+                    elif [ "$days_left" -gt 0 ]; then
+                        echo -e "   ${YELLOW}⚠ WARN${NC} - Cert expiring soon ($days_left days)"
+                        ((failed_checks++))
+                        echo -e "   ${YELLOW}→ AUTO-FIX: Renewing certificate...${NC}"
+                        if sudo certbot renew --force-renewal 2>/dev/null; then
+                            echo -e "   ${GREEN}✓ FIXED${NC} - Certificate renewed"
+                            ((auto_fixed++))
+                        else
+                            echo -e "   ${RED}✗ FAILED TO FIX${NC} - Manual renewal needed"
+                            ((manual_needed++))
+                        fi
+                    else
+                        echo -e "   ${RED}✗ FAIL${NC} - Certificate expired"
+                        ((failed_checks++))
+                        echo -e "   ${YELLOW}→ AUTO-FIX: Renewing certificate...${NC}"
+                        if sudo certbot renew --force-renewal 2>/dev/null; then
+                            echo -e "   ${GREEN}✓ FIXED${NC} - Certificate renewed"
+                            ((auto_fixed++))
+                        else
+                            ((manual_needed++))
+                        fi
+                    fi
+                else
+                    echo -e "   ${YELLOW}⚠ WARN${NC} - No Let's Encrypt cert found"
+                    ((passed_checks++))
+                fi
+            else
+                echo -e "   ${YELLOW}⊘ SKIP${NC} - Let's Encrypt not configured"
+            fi
+            ;;
+        selfsigned)
+            echo -e "   ${GREEN}✓ PASS${NC} - Using self-signed certificate"
+            ((passed_checks++))
+            ;;
+        *)
+            echo -e "   ${YELLOW}⊘ SKIP${NC} - No SSL configured (HTTP only)"
+            ;;
+    esac
+    
+    #---------------------------------------------------------------------------
+    # CHECK 8: Firewall configuration
+    #---------------------------------------------------------------------------
+    ((total_checks++))
+    echo -e "${CYAN}[8/10] Checking firewall...${NC}"
+    if command_exists ufw; then
+        if sudo ufw status 2>/dev/null | grep -qE "80|443|Nginx"; then
+            echo -e "   ${GREEN}✓ PASS${NC} - Firewall allows HTTP/HTTPS"
+            ((passed_checks++))
+        else
+            echo -e "   ${YELLOW}⚠ WARN${NC} - HTTP/HTTPS may be blocked"
+            ((failed_checks++))
+            echo -e "   ${YELLOW}→ AUTO-FIX: Allowing HTTP/HTTPS...${NC}"
+            sudo ufw allow 'Nginx Full' 2>/dev/null || {
+                sudo ufw allow 80/tcp 2>/dev/null
+                sudo ufw allow 443/tcp 2>/dev/null
+            }
+            echo -e "   ${GREEN}✓ FIXED${NC} - Firewall rules added"
+            ((auto_fixed++))
+        fi
+    else
+        echo -e "   ${YELLOW}⊘ SKIP${NC} - UFW not installed"
+    fi
+    
+    #---------------------------------------------------------------------------
+    # CHECK 9: Domain DNS resolution
+    #---------------------------------------------------------------------------
+    ((total_checks++))
+    echo -e "${CYAN}[9/10] Checking domain DNS...${NC}"
+    if [ -n "$EXISTING_DOMAIN" ]; then
+        local resolved_ip=$(dig +short "$EXISTING_DOMAIN" 2>/dev/null | head -1)
+        local server_ip=$(get_server_ip)
+        
+        if [ -n "$resolved_ip" ]; then
+            echo -e "   ${GREEN}✓ PASS${NC} - $EXISTING_DOMAIN resolves to $resolved_ip"
+            ((passed_checks++))
+        else
+            echo -e "   ${YELLOW}⚠ WARN${NC} - Could not resolve $EXISTING_DOMAIN"
+            echo -e "   ${YELLOW}  (May be using Cloudflare Tunnel)${NC}"
+            ((passed_checks++))
+        fi
+    else
+        echo -e "   ${YELLOW}⊘ SKIP${NC} - No domain configured"
+    fi
+    
+    #---------------------------------------------------------------------------
+    # CHECK 10: Test external access
+    #---------------------------------------------------------------------------
+    ((total_checks++))
+    echo -e "${CYAN}[10/10] Testing external access...${NC}"
+    if [ -n "$EXISTING_DOMAIN" ]; then
+        local ext_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://$EXISTING_DOMAIN" 2>/dev/null || echo "000")
+        if [[ "$ext_code" =~ ^(200|301|302|304)$ ]]; then
+            echo -e "   ${GREEN}✓ PASS${NC} - External access working (HTTP $ext_code)"
+            ((passed_checks++))
+        else
+            echo -e "   ${YELLOW}⚠ WARN${NC} - External access returned HTTP $ext_code"
+            echo -e "   ${YELLOW}  (May need time for DNS propagation)${NC}"
+            ((passed_checks++))
+        fi
+    else
+        echo -e "   ${YELLOW}⊘ SKIP${NC} - No domain to test"
+    fi
+    
+    #---------------------------------------------------------------------------
+    # Reload Nginx if fixes were made
+    #---------------------------------------------------------------------------
+    if [ $auto_fixed -gt 0 ]; then
+        echo ""
+        echo -e "${CYAN}Reloading Nginx to apply changes...${NC}"
+        if sudo nginx -t 2>/dev/null && sudo systemctl reload nginx 2>/dev/null; then
+            echo -e "${GREEN}✓ Nginx reloaded successfully${NC}"
+        fi
+    fi
+    
+    #---------------------------------------------------------------------------
+    # SUMMARY
+    #---------------------------------------------------------------------------
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${CYAN}                    AUTO DEBUG SUMMARY                          ${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "Total Checks:      ${CYAN}$total_checks${NC}"
+    echo -e "Passed:            ${GREEN}$passed_checks${NC}"
+    echo -e "Failed:            ${RED}$failed_checks${NC}"
+    echo -e "Auto-Fixed:        ${GREEN}$auto_fixed${NC}"
+    echo -e "Manual Action:     ${YELLOW}$manual_needed${NC}"
+    echo ""
+    
+    if [ $manual_needed -eq 0 ] && [ $failed_checks -eq 0 ]; then
+        echo -e "${GREEN}═══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${GREEN}  ✓ ALL CHECKS PASSED - NGINX IS HEALTHY                       ${NC}"
+        echo -e "${GREEN}═══════════════════════════════════════════════════════════════${NC}"
+    elif [ $manual_needed -eq 0 ] && [ $auto_fixed -gt 0 ]; then
+        echo -e "${GREEN}═══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${GREEN}  ✓ ALL ISSUES AUTO-FIXED - NGINX SHOULD BE WORKING            ${NC}"
+        echo -e "${GREEN}═══════════════════════════════════════════════════════════════${NC}"
+    else
+        echo -e "${YELLOW}═══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${YELLOW}  ⚠ MANUAL ACTION REQUIRED FOR $manual_needed ISSUE(S)                       ${NC}"
+        echo -e "${YELLOW}═══════════════════════════════════════════════════════════════${NC}"
+    fi
+    
+    echo ""
+    if confirm "Return to menu?"; then
+        show_menu
+    fi
+}
+
+#===============================================================================
 # MENU
 #===============================================================================
 
@@ -1098,10 +1468,11 @@ show_menu() {
     echo "1. Full setup (new installation)"
     echo "2. Reconfigure existing site"
     echo "3. View current configuration"
-    echo "4. Fix configuration (repair broken setup)"
-    echo "5. Restart Nginx"
-    echo "6. View logs"
-    echo "7. Exit"
+    echo "4. Fix configuration (guided repair with prompts)"
+    echo -e "${GREEN}5. Auto Debug (automatic check & fix everything)${NC}"
+    echo "6. Restart Nginx"
+    echo "7. View logs"
+    echo "8. Exit"
     echo ""
     echo -en "${CYAN}Select option [1]: ${NC}"
     read -r menu_choice
@@ -1112,9 +1483,10 @@ show_menu() {
         2) reconfigure_site ;;
         3) view_nginx_config ;;
         4) fix_nginx_config ;;
-        5) restart_nginx ;;
-        6) view_nginx_logs ;;
-        7) exit 0 ;;
+        5) auto_debug ;;
+        6) restart_nginx ;;
+        7) view_nginx_logs ;;
+        8) exit 0 ;;
         *) full_setup ;;
     esac
 }

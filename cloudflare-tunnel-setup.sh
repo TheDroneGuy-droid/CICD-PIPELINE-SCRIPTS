@@ -238,18 +238,38 @@ check_dns_record_exists() {
         -H "Authorization: Bearer ${CF_API_TOKEN}" \
         -H "Content-Type: application/json")
     
-    if echo "$response" | grep -q '"count":0'; then
-        return 1  # Record does not exist
+    # Clear previous values to avoid stale data
+    EXISTING_RECORD_ID=""
+    EXISTING_RECORD_TYPE=""
+    EXISTING_RECORD_CONTENT=""
+    
+    # Use jq if available for reliable parsing, otherwise fallback to grep with flexible whitespace
+    if command_exists jq; then
+        local count=$(echo "$response" | jq -r '.result | length' 2>/dev/null)
+        if [ "$count" = "0" ] || [ -z "$count" ]; then
+            return 1  # Record does not exist
+        else
+            # Extract existing record info from first result
+            EXISTING_RECORD_ID=$(echo "$response" | jq -r '.result[0].id' 2>/dev/null)
+            EXISTING_RECORD_TYPE=$(echo "$response" | jq -r '.result[0].type' 2>/dev/null)
+            EXISTING_RECORD_CONTENT=$(echo "$response" | jq -r '.result[0].content' 2>/dev/null)
+            return 0  # Record exists
+        fi
     else
-        # Extract existing record info
-        local record_id=$(echo "$response" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
-        local record_type=$(echo "$response" | grep -o '"type":"[^"]*"' | head -1 | cut -d'"' -f4)
-        local record_content=$(echo "$response" | grep -o '"content":"[^"]*"' | head -1 | cut -d'"' -f4)
-        
-        EXISTING_RECORD_ID="$record_id"
-        EXISTING_RECORD_TYPE="$record_type"
-        EXISTING_RECORD_CONTENT="$record_content"
-        return 0  # Record exists
+        # Fallback: use grep with flexible whitespace pattern
+        if echo "$response" | grep -qE '"count"\s*:\s*0'; then
+            return 1  # Record does not exist
+        else
+            # Extract existing record info (look specifically in result array)
+            local record_id=$(echo "$response" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+            local record_type=$(echo "$response" | grep -o '"type":"[^"]*"' | head -1 | cut -d'"' -f4)
+            local record_content=$(echo "$response" | grep -o '"content":"[^"]*"' | head -1 | cut -d'"' -f4)
+            
+            EXISTING_RECORD_ID="$record_id"
+            EXISTING_RECORD_TYPE="$record_type"
+            EXISTING_RECORD_CONTENT="$record_content"
+            return 0  # Record exists
+        fi
     fi
 }
 
@@ -2178,10 +2198,94 @@ EOCFG
     fi
     
     #---------------------------------------------------------------------------
-    # CHECK 10: Systemd service installed
+    # CHECK 10: DNS Records for configured hostnames
     #---------------------------------------------------------------------------
     ((total_checks++))
-    echo -e "${CYAN}[10/12] Checking systemd service...${NC}"
+    echo -e "${CYAN}[10/13] Verifying DNS records for configured hostnames...${NC}"
+    
+    # Only run if we have API token and tunnel ID
+    if [ -n "$CF_API_TOKEN" ] && [ -n "$TUNNEL_ID" ]; then
+        local tunnel_target="${TUNNEL_ID}.cfargotunnel.com"
+        local config_file="/etc/cloudflared/config.yml"
+        [ ! -f "$config_file" ] && config_file="$CF_CONFIG_FILE"
+        
+        if [ -f "$config_file" ]; then
+            # Extract hostnames from config (excluding catch-all)
+            local hostnames=$(grep -E "^\s*-?\s*hostname:" "$config_file" 2>/dev/null | awk '{print $NF}' | grep -v "^$")
+            
+            if [ -n "$hostnames" ]; then
+                local dns_issues=0
+                local dns_fixed=0
+                
+                echo "$hostnames" | while read -r hostname; do
+                    [ -z "$hostname" ] && continue
+                    
+                    # Get zone ID for this hostname
+                    local host_zone_id=$(get_zone_id "$hostname" 2>/dev/null)
+                    
+                    if [ -n "$host_zone_id" ]; then
+                        # Check if DNS record exists and points to tunnel
+                        if check_dns_record_exists "$host_zone_id" "$hostname"; then
+                            if [ "$EXISTING_RECORD_TYPE" = "CNAME" ] && [ "$EXISTING_RECORD_CONTENT" = "$tunnel_target" ]; then
+                                echo -e "   ${GREEN}✓${NC} $hostname → tunnel"
+                            else
+                                echo -e "   ${YELLOW}⚠${NC} $hostname → wrong target ($EXISTING_RECORD_CONTENT)"
+                                # Auto-fix: Delete and recreate
+                                if [ -n "$EXISTING_RECORD_ID" ]; then
+                                    delete_dns_record "$host_zone_id" "$EXISTING_RECORD_ID" 2>/dev/null
+                                fi
+                                # Extract record name from hostname
+                                local root_domain=$(echo "$hostname" | awk -F. '{if(NF>2){print $(NF-1)"."$NF}else{print $0}}')
+                                local record_name="${hostname%.$root_domain}"
+                                [ "$record_name" = "$hostname" ] && record_name="@"
+                                
+                                if create_dns_record "$host_zone_id" "$record_name" "$tunnel_target" "CNAME" "true" 2>/dev/null; then
+                                    echo -e "   ${GREEN}✓ FIXED${NC} $hostname"
+                                    ((dns_fixed++))
+                                fi
+                            fi
+                        else
+                            echo -e "   ${RED}✗${NC} $hostname → missing DNS record"
+                            # Auto-fix: Create DNS record
+                            local root_domain=$(echo "$hostname" | awk -F. '{if(NF>2){print $(NF-1)"."$NF}else{print $0}}')
+                            local record_name="${hostname%.$root_domain}"
+                            [ "$record_name" = "$hostname" ] && record_name="@"
+                            
+                            if create_dns_record "$host_zone_id" "$record_name" "$tunnel_target" "CNAME" "true" 2>/dev/null; then
+                                echo -e "   ${GREEN}✓ FIXED${NC} $hostname → created DNS record"
+                                ((dns_fixed++))
+                            else
+                                ((dns_issues++))
+                            fi
+                        fi
+                    else
+                        echo -e "   ${YELLOW}⊘${NC} $hostname → zone not found (may be external)"
+                    fi
+                done
+                
+                if [ $dns_issues -eq 0 ]; then
+                    echo -e "   ${GREEN}✓ PASS${NC} - All DNS records verified/fixed"
+                    ((passed_checks++))
+                else
+                    echo -e "   ${YELLOW}⚠ WARN${NC} - Some DNS records could not be auto-fixed"
+                    ((failed_checks++))
+                    ((manual_needed++))
+                fi
+            else
+                echo -e "   ${YELLOW}⊘ SKIP${NC} - No hostnames found in config"
+            fi
+        else
+            echo -e "   ${YELLOW}⊘ SKIP${NC} - No config file to read hostnames from"
+        fi
+    else
+        echo -e "   ${YELLOW}⊘ SKIP${NC} - API token or tunnel ID not available"
+    fi
+    
+    #---------------------------------------------------------------------------
+    # CHECK 11: Systemd service installed
+    #---------------------------------------------------------------------------
+    ((total_checks++))
+    echo -e "${CYAN}[11/13] Checking systemd service...${NC}"
     if systemctl list-unit-files 2>/dev/null | grep -q cloudflared; then
         echo -e "   ${GREEN}✓ PASS${NC} - Service unit file exists"
         ((passed_checks++))
@@ -2224,10 +2328,10 @@ EOSVC
     fi
     
     #---------------------------------------------------------------------------
-    # CHECK 11: Service enabled
+    # CHECK 12: Service enabled
     #---------------------------------------------------------------------------
     ((total_checks++))
-    echo -e "${CYAN}[11/12] Checking service is enabled...${NC}"
+    echo -e "${CYAN}[12/13] Checking service is enabled...${NC}"
     if systemctl list-unit-files 2>/dev/null | grep -q cloudflared; then
         if sudo systemctl is-enabled --quiet cloudflared 2>/dev/null; then
             echo -e "   ${GREEN}✓ PASS${NC} - Service is enabled (auto-start on boot)"
@@ -2249,10 +2353,10 @@ EOSVC
     fi
     
     #---------------------------------------------------------------------------
-    # CHECK 12: Service running
+    # CHECK 13: Service running
     #---------------------------------------------------------------------------
     ((total_checks++))
-    echo -e "${CYAN}[12/12] Checking service is running...${NC}"
+    echo -e "${CYAN}[13/13] Checking service is running...${NC}"
     if sudo systemctl is-active --quiet cloudflared 2>/dev/null; then
         echo -e "   ${GREEN}✓ PASS${NC} - Service is running"
         ((passed_checks++))

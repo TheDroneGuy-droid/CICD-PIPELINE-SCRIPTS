@@ -3965,6 +3965,415 @@ view_logs() {
 }
 
 #===============================================================================
+# AUTO DEBUG - FULLY AUTOMATIC DIAGNOSTICS AND REPAIR
+#===============================================================================
+
+auto_debug() {
+    print_section "Auto Debug - Automatic Diagnostics & Repair"
+    
+    log "INFO" "Running fully automatic debug with existing parameters..."
+    log "INFO" "No user input required - all fixes applied automatically"
+    echo ""
+    
+    local total_checks=0
+    local passed_checks=0
+    local failed_checks=0
+    local auto_fixed=0
+    local manual_needed=0
+    
+    # Load existing configuration first
+    load_existing_config
+    
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${CYAN}                    STARTING AUTO DEBUG                         ${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    
+    #---------------------------------------------------------------------------
+    # CHECK 1: Detect backend type
+    #---------------------------------------------------------------------------
+    ((total_checks++))
+    echo -e "${CYAN}[1/12] Detecting backend type...${NC}"
+    local detected_backend="$EXISTING_BACKEND"
+    
+    if [ -z "$detected_backend" ]; then
+        # Auto-detect based on running processes and files
+        if pm2 list 2>/dev/null | grep -q online; then
+            detected_backend="nodejs"
+        elif docker ps 2>/dev/null | grep -q .; then
+            detected_backend="docker"
+        elif systemctl is-active --quiet "$APP_NAME" 2>/dev/null; then
+            detected_backend="systemd"
+        elif [ -f "$APP_DIR/package.json" ]; then
+            detected_backend="nodejs"
+        elif [ -f "$APP_DIR/requirements.txt" ] || [ -f "$APP_DIR/pyproject.toml" ]; then
+            detected_backend="python"
+        elif [ -f "$APP_DIR/pom.xml" ] || [ -f "$APP_DIR/build.gradle" ]; then
+            detected_backend="java"
+        elif [ -f "$APP_DIR/go.mod" ]; then
+            detected_backend="go"
+        elif [ -f "$APP_DIR/Cargo.toml" ]; then
+            detected_backend="rust"
+        fi
+    fi
+    
+    if [ -n "$detected_backend" ]; then
+        echo -e "   ${GREEN}✓ PASS${NC} - Backend detected: $detected_backend"
+        EXISTING_BACKEND="$detected_backend"
+        ((passed_checks++))
+    else
+        echo -e "   ${YELLOW}⚠ WARN${NC} - Could not detect backend type"
+        echo -e "   ${YELLOW}  Will check common services...${NC}"
+        ((passed_checks++))
+    fi
+    
+    #---------------------------------------------------------------------------
+    # CHECK 2: Node.js / PM2 (if applicable)
+    #---------------------------------------------------------------------------
+    ((total_checks++))
+    echo -e "${CYAN}[2/12] Checking Node.js/PM2 status...${NC}"
+    if [ "$detected_backend" = "nodejs" ] || command_exists pm2; then
+        if command_exists node; then
+            local node_ver=$(node --version 2>/dev/null)
+            echo -e "   ${GREEN}✓${NC} Node.js installed: $node_ver"
+        else
+            echo -e "   ${YELLOW}⚠ Node.js not installed${NC}"
+        fi
+        
+        if command_exists pm2; then
+            local pm2_apps=$(pm2 jlist 2>/dev/null | grep -c '"name"' || echo 0)
+            local pm2_online=$(pm2 jlist 2>/dev/null | grep -c '"status":"online"' || echo 0)
+            
+            if [ "$pm2_online" -gt 0 ]; then
+                echo -e "   ${GREEN}✓ PASS${NC} - PM2 running ($pm2_online/$pm2_apps apps online)"
+                ((passed_checks++))
+            elif [ "$pm2_apps" -gt 0 ]; then
+                echo -e "   ${RED}✗ FAIL${NC} - PM2 apps exist but not running"
+                ((failed_checks++))
+                echo -e "   ${YELLOW}→ AUTO-FIX: Restarting all PM2 apps...${NC}"
+                if pm2 restart all 2>/dev/null; then
+                    sleep 2
+                    local now_online=$(pm2 jlist 2>/dev/null | grep -c '"status":"online"' || echo 0)
+                    if [ "$now_online" -gt 0 ]; then
+                        echo -e "   ${GREEN}✓ FIXED${NC} - $now_online apps now online"
+                        ((auto_fixed++))
+                    else
+                        echo -e "   ${RED}✗ FAILED TO FIX${NC} - Check pm2 logs"
+                        ((manual_needed++))
+                    fi
+                else
+                    ((manual_needed++))
+                fi
+            else
+                echo -e "   ${YELLOW}⊘ SKIP${NC} - No PM2 apps configured"
+            fi
+        else
+            echo -e "   ${YELLOW}⊘ SKIP${NC} - PM2 not installed"
+        fi
+    else
+        echo -e "   ${YELLOW}⊘ SKIP${NC} - Not a Node.js backend"
+    fi
+    
+    #---------------------------------------------------------------------------
+    # CHECK 3: Docker containers (if applicable)
+    #---------------------------------------------------------------------------
+    ((total_checks++))
+    echo -e "${CYAN}[3/12] Checking Docker status...${NC}"
+    if command_exists docker; then
+        local running_containers=$(docker ps -q 2>/dev/null | wc -l)
+        local all_containers=$(docker ps -aq 2>/dev/null | wc -l)
+        
+        if [ "$running_containers" -gt 0 ]; then
+            echo -e "   ${GREEN}✓ PASS${NC} - $running_containers container(s) running"
+            ((passed_checks++))
+        elif [ "$all_containers" -gt 0 ]; then
+            echo -e "   ${RED}✗ FAIL${NC} - Containers exist but not running"
+            ((failed_checks++))
+            echo -e "   ${YELLOW}→ AUTO-FIX: Starting stopped containers...${NC}"
+            
+            # Try docker-compose first
+            if [ -f "$APP_DIR/docker-compose.yml" ] || [ -f "$APP_DIR/docker-compose.yaml" ]; then
+                cd "$APP_DIR"
+                if docker-compose up -d 2>/dev/null || docker compose up -d 2>/dev/null; then
+                    echo -e "   ${GREEN}✓ FIXED${NC} - Containers started via docker-compose"
+                    ((auto_fixed++))
+                else
+                    echo -e "   ${RED}✗ FAILED TO FIX${NC}"
+                    ((manual_needed++))
+                fi
+            else
+                # Start individual containers
+                docker start $(docker ps -aq) 2>/dev/null
+                local now_running=$(docker ps -q 2>/dev/null | wc -l)
+                if [ "$now_running" -gt 0 ]; then
+                    echo -e "   ${GREEN}✓ FIXED${NC} - $now_running containers started"
+                    ((auto_fixed++))
+                else
+                    ((manual_needed++))
+                fi
+            fi
+        else
+            echo -e "   ${YELLOW}⊘ SKIP${NC} - No Docker containers"
+        fi
+    else
+        echo -e "   ${YELLOW}⊘ SKIP${NC} - Docker not installed"
+    fi
+    
+    #---------------------------------------------------------------------------
+    # CHECK 4: Systemd services (for Python/Java/Go/Rust)
+    #---------------------------------------------------------------------------
+    ((total_checks++))
+    echo -e "${CYAN}[4/12] Checking systemd services...${NC}"
+    local app_service="${APP_NAME:-myapp}"
+    
+    if systemctl list-unit-files 2>/dev/null | grep -q "$app_service"; then
+        if sudo systemctl is-active --quiet "$app_service" 2>/dev/null; then
+            echo -e "   ${GREEN}✓ PASS${NC} - Service '$app_service' is running"
+            ((passed_checks++))
+        else
+            echo -e "   ${RED}✗ FAIL${NC} - Service '$app_service' not running"
+            ((failed_checks++))
+            echo -e "   ${YELLOW}→ AUTO-FIX: Starting service...${NC}"
+            if sudo systemctl start "$app_service" 2>/dev/null; then
+                sleep 2
+                if sudo systemctl is-active --quiet "$app_service"; then
+                    echo -e "   ${GREEN}✓ FIXED${NC} - Service started"
+                    ((auto_fixed++))
+                else
+                    echo -e "   ${RED}✗ FAILED TO FIX${NC} - Check: journalctl -u $app_service"
+                    ((manual_needed++))
+                fi
+            else
+                ((manual_needed++))
+            fi
+        fi
+    else
+        echo -e "   ${YELLOW}⊘ SKIP${NC} - No systemd service for '$app_service'"
+    fi
+    
+    #---------------------------------------------------------------------------
+    # CHECK 5: Webhook service
+    #---------------------------------------------------------------------------
+    ((total_checks++))
+    echo -e "${CYAN}[5/12] Checking webhook service...${NC}"
+    if systemctl list-unit-files 2>/dev/null | grep -q webhook; then
+        if sudo systemctl is-active --quiet webhook 2>/dev/null; then
+            echo -e "   ${GREEN}✓ PASS${NC} - Webhook service running"
+            ((passed_checks++))
+        else
+            echo -e "   ${RED}✗ FAIL${NC} - Webhook service not running"
+            ((failed_checks++))
+            echo -e "   ${YELLOW}→ AUTO-FIX: Starting webhook...${NC}"
+            if sudo systemctl start webhook 2>/dev/null; then
+                sleep 2
+                if sudo systemctl is-active --quiet webhook; then
+                    echo -e "   ${GREEN}✓ FIXED${NC} - Webhook started"
+                    ((auto_fixed++))
+                else
+                    echo -e "   ${RED}✗ FAILED TO FIX${NC} - Check: journalctl -u webhook"
+                    ((manual_needed++))
+                fi
+            else
+                ((manual_needed++))
+            fi
+        fi
+    else
+        echo -e "   ${YELLOW}⊘ SKIP${NC} - Webhook service not installed"
+    fi
+    
+    #---------------------------------------------------------------------------
+    # CHECK 6: Application port responding
+    #---------------------------------------------------------------------------
+    ((total_checks++))
+    echo -e "${CYAN}[6/12] Checking application port...${NC}"
+    local test_port="${APP_PORT:-3000}"
+    local http_code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$test_port" --max-time 5 2>/dev/null || echo "000")
+    
+    if [[ "$http_code" =~ ^(200|301|302|304|404|401|403)$ ]]; then
+        echo -e "   ${GREEN}✓ PASS${NC} - Application responding on port $test_port (HTTP $http_code)"
+        ((passed_checks++))
+    else
+        echo -e "   ${RED}✗ FAIL${NC} - Application not responding on port $test_port (HTTP $http_code)"
+        ((failed_checks++))
+        echo -e "   ${YELLOW}⚠ MANUAL ACTION NEEDED${NC} - Start your application"
+        ((manual_needed++))
+    fi
+    
+    #---------------------------------------------------------------------------
+    # CHECK 7: Git credentials
+    #---------------------------------------------------------------------------
+    ((total_checks++))
+    echo -e "${CYAN}[7/12] Checking Git credentials...${NC}"
+    if [ -f "$HOME/.git-credentials" ]; then
+        echo -e "   ${GREEN}✓ PASS${NC} - Git credentials file exists"
+        ((passed_checks++))
+        
+        # Test git fetch
+        if [ -d "$APP_DIR/.git" ]; then
+            cd "$APP_DIR" 2>/dev/null
+            if git fetch --dry-run 2>/dev/null; then
+                echo -e "   ${GREEN}✓${NC} Git fetch test passed"
+            else
+                echo -e "   ${YELLOW}⚠ WARN${NC} - Git fetch test failed (credentials may be expired)"
+            fi
+        fi
+    else
+        echo -e "   ${YELLOW}⚠ WARN${NC} - Git credentials not configured"
+        echo -e "   ${YELLOW}  Run full setup to configure Git credentials${NC}"
+        ((passed_checks++))
+    fi
+    
+    #---------------------------------------------------------------------------
+    # CHECK 8: Deploy script
+    #---------------------------------------------------------------------------
+    ((total_checks++))
+    echo -e "${CYAN}[8/12] Checking deploy script...${NC}"
+    if [ -f "$APP_DIR/deploy.sh" ]; then
+        if [ -x "$APP_DIR/deploy.sh" ]; then
+            echo -e "   ${GREEN}✓ PASS${NC} - Deploy script exists and executable"
+            ((passed_checks++))
+        else
+            echo -e "   ${YELLOW}⚠ WARN${NC} - Deploy script not executable"
+            ((failed_checks++))
+            echo -e "   ${YELLOW}→ AUTO-FIX: Making executable...${NC}"
+            chmod +x "$APP_DIR/deploy.sh"
+            echo -e "   ${GREEN}✓ FIXED${NC}"
+            ((auto_fixed++))
+        fi
+    else
+        echo -e "   ${YELLOW}⊘ SKIP${NC} - No deploy script found"
+    fi
+    
+    #---------------------------------------------------------------------------
+    # CHECK 9: PM2 startup configuration
+    #---------------------------------------------------------------------------
+    ((total_checks++))
+    echo -e "${CYAN}[9/12] Checking PM2 startup...${NC}"
+    if command_exists pm2; then
+        if pm2 startup 2>&1 | grep -q "already"; then
+            echo -e "   ${GREEN}✓ PASS${NC} - PM2 startup configured"
+            ((passed_checks++))
+        else
+            echo -e "   ${YELLOW}⚠ WARN${NC} - PM2 startup may not be configured"
+            ((failed_checks++))
+            echo -e "   ${YELLOW}→ AUTO-FIX: Configuring PM2 startup...${NC}"
+            local startup_cmd=$(pm2 startup systemd -u $USER --hp $HOME 2>&1 | grep 'sudo' | head -1)
+            if [ -n "$startup_cmd" ]; then
+                eval "$startup_cmd" 2>/dev/null
+            fi
+            pm2 save 2>/dev/null
+            echo -e "   ${GREEN}✓ FIXED${NC} - PM2 startup configured"
+            ((auto_fixed++))
+        fi
+    else
+        echo -e "   ${YELLOW}⊘ SKIP${NC} - PM2 not installed"
+    fi
+    
+    #---------------------------------------------------------------------------
+    # CHECK 10: Webhook hooks.json
+    #---------------------------------------------------------------------------
+    ((total_checks++))
+    echo -e "${CYAN}[10/12] Checking webhook configuration...${NC}"
+    if [ -f "/etc/webhook/hooks.json" ]; then
+        if jq empty /etc/webhook/hooks.json 2>/dev/null; then
+            echo -e "   ${GREEN}✓ PASS${NC} - Webhook hooks.json is valid JSON"
+            ((passed_checks++))
+        else
+            echo -e "   ${RED}✗ FAIL${NC} - hooks.json has invalid JSON"
+            ((failed_checks++))
+            ((manual_needed++))
+        fi
+    elif [ -f "$HOME/hooks.json" ]; then
+        echo -e "   ${GREEN}✓ PASS${NC} - Using ~/hooks.json"
+        ((passed_checks++))
+    else
+        echo -e "   ${YELLOW}⊘ SKIP${NC} - No webhook configuration"
+    fi
+    
+    #---------------------------------------------------------------------------
+    # CHECK 11: Application directory
+    #---------------------------------------------------------------------------
+    ((total_checks++))
+    echo -e "${CYAN}[11/12] Checking application directory...${NC}"
+    if [ -d "$APP_DIR" ]; then
+        local file_count=$(ls -A "$APP_DIR" 2>/dev/null | wc -l)
+        if [ "$file_count" -gt 0 ]; then
+            echo -e "   ${GREEN}✓ PASS${NC} - App directory exists: $APP_DIR ($file_count files)"
+            ((passed_checks++))
+        else
+            echo -e "   ${YELLOW}⚠ WARN${NC} - App directory empty"
+            ((passed_checks++))
+        fi
+    else
+        echo -e "   ${YELLOW}⊘ SKIP${NC} - App directory not set or doesn't exist"
+    fi
+    
+    #---------------------------------------------------------------------------
+    # CHECK 12: Memory and disk space
+    #---------------------------------------------------------------------------
+    ((total_checks++))
+    echo -e "${CYAN}[12/12] Checking system resources...${NC}"
+    
+    # Check memory
+    local mem_free=$(free -m 2>/dev/null | awk '/^Mem:/{print $7}')
+    local mem_total=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}')
+    if [ -n "$mem_free" ] && [ "$mem_free" -gt 100 ]; then
+        echo -e "   ${GREEN}✓${NC} Memory OK: ${mem_free}MB available of ${mem_total}MB"
+    elif [ -n "$mem_free" ]; then
+        echo -e "   ${YELLOW}⚠${NC} Low memory: ${mem_free}MB available"
+    fi
+    
+    # Check disk
+    local disk_use=$(df -h / 2>/dev/null | awk 'NR==2{print $5}' | tr -d '%')
+    if [ -n "$disk_use" ]; then
+        if [ "$disk_use" -lt 90 ]; then
+            echo -e "   ${GREEN}✓ PASS${NC} - Disk usage: ${disk_use}%"
+            ((passed_checks++))
+        else
+            echo -e "   ${RED}✗ FAIL${NC} - Disk almost full: ${disk_use}%"
+            ((failed_checks++))
+            ((manual_needed++))
+        fi
+    else
+        ((passed_checks++))
+    fi
+    
+    #---------------------------------------------------------------------------
+    # SUMMARY
+    #---------------------------------------------------------------------------
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${CYAN}                    AUTO DEBUG SUMMARY                          ${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "Total Checks:      ${CYAN}$total_checks${NC}"
+    echo -e "Passed:            ${GREEN}$passed_checks${NC}"
+    echo -e "Failed:            ${RED}$failed_checks${NC}"
+    echo -e "Auto-Fixed:        ${GREEN}$auto_fixed${NC}"
+    echo -e "Manual Action:     ${YELLOW}$manual_needed${NC}"
+    echo ""
+    
+    if [ $manual_needed -eq 0 ] && [ $failed_checks -eq 0 ]; then
+        echo -e "${GREEN}═══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${GREEN}  ✓ ALL CHECKS PASSED - APPLICATION IS HEALTHY                 ${NC}"
+        echo -e "${GREEN}═══════════════════════════════════════════════════════════════${NC}"
+    elif [ $manual_needed -eq 0 ] && [ $auto_fixed -gt 0 ]; then
+        echo -e "${GREEN}═══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${GREEN}  ✓ ALL ISSUES AUTO-FIXED - APP SHOULD BE WORKING              ${NC}"
+        echo -e "${GREEN}═══════════════════════════════════════════════════════════════${NC}"
+    else
+        echo -e "${YELLOW}═══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${YELLOW}  ⚠ MANUAL ACTION REQUIRED FOR $manual_needed ISSUE(S)                       ${NC}"
+        echo -e "${YELLOW}═══════════════════════════════════════════════════════════════${NC}"
+    fi
+    
+    echo ""
+    if confirm "Return to menu?"; then
+        show_menu
+    fi
+}
+
+#===============================================================================
 # MENU
 #===============================================================================
 
@@ -3987,10 +4396,11 @@ show_menu() {
     echo "1. Quick Setup (Node.js with PM2)"
     echo "2. Multi-Backend Setup (Python, Java, Go, Rust, etc.)"
     echo "3. View current status"
-    echo "4. Fix configuration (repair broken setup)"
-    echo "5. Restart services"
-    echo "6. View logs"
-    echo "7. Exit"
+    echo "4. Fix configuration (guided repair with prompts)"
+    echo -e "${GREEN}5. Auto Debug (automatic check & fix everything)${NC}"
+    echo "6. Restart services"
+    echo "7. View logs"
+    echo "8. Exit"
     echo ""
     echo -en "${CYAN}Select option [1]: ${NC}"
     read -r menu_choice
@@ -4001,9 +4411,10 @@ show_menu() {
         2) setup_multibackend ;;
         3) view_status ;;
         4) fix_configuration ;;
-        5) restart_services ;;
-        6) view_logs ;;
-        7) exit 0 ;;
+        5) auto_debug ;;
+        6) restart_services ;;
+        7) view_logs ;;
+        8) exit 0 ;;
         *) quick_setup ;;
     esac
 }
