@@ -1754,6 +1754,7 @@ auto_debug() {
     local failed_checks=0
     local auto_fixed=0
     local manual_needed=0
+    local config_changed=0  # Track if config/DNS was modified to trigger service restart
     
     # Load existing configuration first
     load_existing_config
@@ -2199,7 +2200,7 @@ EOCFG
     fi
     
     #---------------------------------------------------------------------------
-    # CHECK 10: DNS Records for configured hostnames
+    # CHECK 10: DNS Records and Ingress Rules for configured hostnames
     #---------------------------------------------------------------------------
     : $((total_checks++))
     echo -e "${CYAN}[10/13] Verifying DNS records for configured hostnames...${NC}"
@@ -2218,7 +2219,8 @@ EOCFG
                 local dns_issues=0
                 local dns_fixed=0
                 
-                echo "$hostnames" | while read -r hostname; do
+                # Use process substitution to avoid subshell (preserves variable changes)
+                while read -r hostname; do
                     [ -z "$hostname" ] && continue
                     
                     # Get zone ID for this hostname
@@ -2243,6 +2245,7 @@ EOCFG
                                 if create_dns_record "$host_zone_id" "$record_name" "$tunnel_target" "CNAME" "true" 2>/dev/null; then
                                     echo -e "   ${GREEN}✓ FIXED${NC} $hostname"
                                     : $((dns_fixed++))
+                                    : $((config_changed++))
                                 fi
                             fi
                         else
@@ -2255,6 +2258,7 @@ EOCFG
                             if create_dns_record "$host_zone_id" "$record_name" "$tunnel_target" "CNAME" "true" 2>/dev/null; then
                                 echo -e "   ${GREEN}✓ FIXED${NC} $hostname → created DNS record"
                                 : $((dns_fixed++))
+                                : $((config_changed++))
                             else
                                 : $((dns_issues++))
                             fi
@@ -2262,7 +2266,12 @@ EOCFG
                     else
                         echo -e "   ${YELLOW}⊘${NC} $hostname → zone not found (may be external)"
                     fi
-                done
+                done <<< "$hostnames"
+                
+                # Update counters based on results
+                if [ $dns_fixed -gt 0 ]; then
+                    : $((auto_fixed++))
+                fi
                 
                 if [ $dns_issues -eq 0 ]; then
                     echo -e "   ${GREEN}✓ PASS${NC} - All DNS records verified/fixed"
@@ -2280,6 +2289,78 @@ EOCFG
         fi
     else
         echo -e "   ${YELLOW}⊘ SKIP${NC} - API token or tunnel ID not available"
+    fi
+
+    #---------------------------------------------------------------------------
+    # CHECK 10.5: Verify www ingress rules exist in config
+    #---------------------------------------------------------------------------
+    if [ -n "$TUNNEL_ID" ]; then
+        local config_file="/etc/cloudflared/config.yml"
+        [ ! -f "$config_file" ] && config_file="$CF_CONFIG_FILE"
+        
+        if [ -f "$config_file" ]; then
+            # Get all hostnames from config
+            local hostnames=$(grep -E "^\s*-?\s*hostname:" "$config_file" 2>/dev/null | awk '{print $NF}' | grep -v "^$")
+            
+            # Find root domains (without www) that don't have www variant in ingress
+            local missing_www=""
+            while read -r hostname; do
+                [ -z "$hostname" ] && continue
+                # Skip if already a www hostname
+                [[ "$hostname" == www.* ]] && continue
+                
+                local www_hostname="www.$hostname"
+                # Check if www variant exists in config
+                if ! echo "$hostnames" | grep -qx "$www_hostname"; then
+                    missing_www="$missing_www $www_hostname"
+                fi
+            done <<< "$hostnames"
+            
+            if [ -n "$missing_www" ]; then
+                echo -e "   ${YELLOW}⚠${NC} Missing www ingress rules detected"
+                
+                for www_host in $missing_www; do
+                    # Get the service URL from the non-www version
+                    local base_host="${www_host#www.}"
+                    local service_url=$(grep -A2 "hostname: $base_host\$" "$config_file" 2>/dev/null | grep "service:" | awk '{print $2}' | head -1)
+                    
+                    if [ -n "$service_url" ]; then
+                        # Add www ingress rule before catch-all
+                        echo -e "   ${YELLOW}→ AUTO-FIX:${NC} Adding ingress rule for $www_host"
+                        
+                        # Find position of catch-all and insert before it
+                        local catch_all_line=$(grep -n "service: http_status:404" "$config_file" | tail -1 | cut -d: -f1)
+                        if [ -n "$catch_all_line" ]; then
+                            # Create temporary file with new ingress entry
+                            local tmp_file=$(mktemp)
+                            head -n $((catch_all_line - 1)) "$config_file" > "$tmp_file"
+                            echo "  # $www_host (auto-added)" >> "$tmp_file"
+                            echo "  - hostname: $www_host" >> "$tmp_file"
+                            echo "    service: $service_url" >> "$tmp_file"
+                            echo "" >> "$tmp_file"
+                            tail -n +$catch_all_line "$config_file" >> "$tmp_file"
+                            sudo cp "$tmp_file" "$config_file"
+                            rm -f "$tmp_file"
+                            
+                            echo -e "   ${GREEN}✓ FIXED${NC} Added ingress rule for $www_host"
+                            : $((auto_fixed++))
+                            : $((config_changed++))
+                            
+                            # Also create DNS record if API token available
+                            if [ -n "$CF_API_TOKEN" ]; then
+                                local host_zone_id=$(get_zone_id "$www_host" 2>/dev/null)
+                                if [ -n "$host_zone_id" ]; then
+                                    local tunnel_target="${TUNNEL_ID}.cfargotunnel.com"
+                                    if ! check_dns_record_exists "$host_zone_id" "$www_host"; then
+                                        create_dns_record "$host_zone_id" "www" "$tunnel_target" "CNAME" "true" 2>/dev/null
+                                    fi
+                                fi
+                            fi
+                        fi
+                    fi
+                done
+            fi
+        fi
     fi
     
     #---------------------------------------------------------------------------
@@ -2354,10 +2435,21 @@ EOSVC
     fi
     
     #---------------------------------------------------------------------------
-    # CHECK 13: Service running
+    # CHECK 13: Service running (restart if config changed)
     #---------------------------------------------------------------------------
     : $((total_checks++))
     echo -e "${CYAN}[13/13] Checking service is running...${NC}"
+    
+    # If config was changed, restart service to apply changes
+    if [ $config_changed -gt 0 ]; then
+        echo -e "   ${YELLOW}→${NC} Config was modified, restarting service to apply changes..."
+        sudo systemctl daemon-reload
+        if sudo systemctl restart cloudflared 2>/dev/null; then
+            sleep 3
+            echo -e "   ${GREEN}✓${NC} Service restarted"
+        fi
+    fi
+    
     if sudo systemctl is-active --quiet cloudflared 2>/dev/null; then
         echo -e "   ${GREEN}✓ PASS${NC} - Service is running"
         : $((passed_checks++))
