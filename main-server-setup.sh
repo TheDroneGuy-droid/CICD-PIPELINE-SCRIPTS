@@ -91,16 +91,39 @@ retry_command() {
 collect_inputs() {
     print_section "Configuration Setup"
     
-    # App name
+    # Project directory
+    echo ""
+    echo -e "${YELLOW}Project Directory Setup${NC}"
+    echo -e "Enter the full path where your project is located or will be cloned."
+    echo -e "Examples: /home/user/my-app, /var/www/project, /opt/myproject"
+    echo ""
+    echo -en "${CYAN}Enter project directory [${PARENT_DIR}]: ${NC}"
+    read -r APP_DIR
+    APP_DIR=${APP_DIR:-$PARENT_DIR}
+    
+    # Expand ~ to home directory if used
+    APP_DIR="${APP_DIR/#\~/$HOME}"
+    
+    # Create directory if it doesn't exist
+    if [ ! -d "$APP_DIR" ]; then
+        echo -e "${YELLOW}Directory does not exist: $APP_DIR${NC}"
+        if confirm "Create this directory?"; then
+            mkdir -p "$APP_DIR"
+            log "INFO" "Created directory: $APP_DIR"
+        else
+            log "ERROR" "Directory is required. Exiting."
+            exit 1
+        fi
+    fi
+    
+    log "INFO" "Project directory: $APP_DIR"
+    
+    # App name (derive from directory name by default)
     local default_app_name
-    default_app_name=$(basename "$PARENT_DIR" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')
+    default_app_name=$(basename "$APP_DIR" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')
     echo -en "${CYAN}Enter application name [${default_app_name}]: ${NC}"
     read -r APP_NAME
     APP_NAME=${APP_NAME:-$default_app_name}
-    
-    # App directory
-    APP_DIR="$PARENT_DIR"
-    log "INFO" "Application directory: $APP_DIR"
     
     # GitHub credentials
     echo ""
