@@ -828,22 +828,7 @@ EOF
         fi
     fi
     
-    # Service type
-    echo ""
-    echo -e "${YELLOW}Service Types:${NC}"
-    echo "1. HTTP (web server on port 80)"
-    echo "2. HTTPS (web server with SSL)"
-    echo "3. Custom HTTP port"
-    echo "4. Custom HTTPS port (e.g., Proxmox)"
-    echo "5. SSH"
-    echo "6. RDP"
-    echo "7. TCP (custom)"
-    echo ""
-    echo -en "${CYAN}Select service type [1]: ${NC}"
-    read -r service_type
-    service_type=${service_type:-1}
-    
-    # Target IP
+    # Target IP first (needed for auto-detection)
     echo ""
     echo -en "${CYAN}Enter target server IP (e.g., 192.168.1.100): ${NC}"
     read -r TARGET_IP
@@ -852,6 +837,53 @@ EOF
         echo -en "${CYAN}Enter target server IP: ${NC}"
         read -r TARGET_IP
     done
+    
+    # Service type
+    echo ""
+    echo -e "${YELLOW}Service Types:${NC}"
+    echo "1. HTTP (web server on port 80)"
+    echo "2. HTTPS (web server with SSL on port 443)"
+    echo "3. Custom port (auto-detect HTTP/HTTPS)"
+    echo "4. Proxmox/VMware (HTTPS on port 8006/443)"
+    echo "5. SSH"
+    echo "6. RDP"
+    echo "7. TCP (manual protocol)"
+    echo ""
+    echo -e "${CYAN}TIP: Most admin panels (Proxmox, Portainer, etc.) use HTTPS!${NC}"
+    echo ""
+    echo -en "${CYAN}Select service type [3]: ${NC}"
+    read -r service_type
+    service_type=${service_type:-3}
+    
+    # Function to detect protocol
+    detect_protocol() {
+        local ip="$1"
+        local port="$2"
+        
+        # Try HTTPS first (most admin panels use HTTPS)
+        if timeout 3 bash -c "echo | openssl s_client -connect ${ip}:${port} 2>/dev/null | grep -q 'CONNECTED'" 2>/dev/null; then
+            echo "https"
+            return 0
+        fi
+        
+        # Try HTTP
+        if timeout 2 bash -c "echo -e 'HEAD / HTTP/1.0\r\n\r\n' | nc -w2 ${ip} ${port} 2>/dev/null | grep -q 'HTTP'" 2>/dev/null; then
+            echo "http"
+            return 0
+        fi
+        
+        # Fallback: check common HTTPS ports
+        case "$port" in
+            443|8443|8006|9443|8080|9090)
+                echo "https"
+                return 0
+                ;;
+            *)
+                echo "http"
+                return 0
+                ;;
+        esac
+    }
     
     # Determine service URL
     case $service_type in
@@ -865,17 +897,46 @@ EOF
             NO_TLS_VERIFY="true"
             ;;
         3)
-            echo -en "${CYAN}Enter HTTP port: ${NC}"
+            echo -en "${CYAN}Enter port: ${NC}"
             read -r custom_port
-            SERVICE_URL="http://${TARGET_IP}:${custom_port}"
-            SERVICE_PROTO="http"
+            while [ -z "$custom_port" ]; do
+                echo -e "${RED}Port is required!${NC}"
+                echo -en "${CYAN}Enter port: ${NC}"
+                read -r custom_port
+            done
+            
+            echo -en "  Detecting protocol for ${TARGET_IP}:${custom_port}... "
+            detected_proto=$(detect_protocol "$TARGET_IP" "$custom_port")
+            echo -e "${GREEN}${detected_proto}${NC}"
+            
+            # Confirm or override
+            echo -e "${CYAN}Detected: ${detected_proto}${NC}"
+            echo -en "${CYAN}Use ${detected_proto}? [Y/n]: ${NC}"
+            read -r use_detected
+            if [[ "$use_detected" =~ ^[nN] ]]; then
+                if [ "$detected_proto" = "https" ]; then
+                    detected_proto="http"
+                else
+                    detected_proto="https"
+                fi
+                echo -e "${YELLOW}Changed to: ${detected_proto}${NC}"
+            fi
+            
+            SERVICE_URL="${detected_proto}://${TARGET_IP}:${custom_port}"
+            SERVICE_PROTO="$detected_proto"
+            if [ "$detected_proto" = "https" ]; then
+                NO_TLS_VERIFY="true"
+            fi
             ;;
         4)
-            echo -en "${CYAN}Enter HTTPS port: ${NC}"
+            # Proxmox/VMware preset
+            echo -en "${CYAN}Enter HTTPS port [8006]: ${NC}"
             read -r custom_port
+            custom_port=${custom_port:-8006}
             SERVICE_URL="https://${TARGET_IP}:${custom_port}"
             SERVICE_PROTO="https"
             NO_TLS_VERIFY="true"
+            log "INFO" "Using HTTPS with noTLSVerify (required for self-signed certs)"
             ;;
         5)
             SERVICE_URL="ssh://${TARGET_IP}:22"
@@ -892,12 +953,22 @@ EOF
             read -r custom_port
             SERVICE_URL="${proto}://${TARGET_IP}:${custom_port}"
             SERVICE_PROTO="$proto"
+            if [ "$proto" = "https" ]; then
+                NO_TLS_VERIFY="true"
+            fi
             ;;
         *)
             SERVICE_URL="http://${TARGET_IP}:80"
             SERVICE_PROTO="http"
             ;;
     esac
+    
+    # Show protocol warning for HTTPS
+    if [ "$SERVICE_PROTO" = "https" ]; then
+        echo ""
+        echo -e "${GREEN}✓ Using HTTPS with noTLSVerify: true${NC}"
+        echo -e "${CYAN}  (Required for self-signed certificates like Proxmox)${NC}"
+    fi
     
     # Summary
     echo ""
@@ -1486,6 +1557,54 @@ EOF
 }
 
 #===============================================================================
+# ENSURE SERVICE RUNNING (auto-create/restart)
+#===============================================================================
+
+ensure_service_running() {
+    log "INFO" "Ensuring cloudflared service is running..."
+    
+    # Copy config to system location
+    sudo mkdir -p /etc/cloudflared
+    sudo cp "$CF_CONFIG_FILE" /etc/cloudflared/config.yml
+    
+    # Copy credentials if they exist
+    if [ -n "$TUNNEL_ID" ]; then
+        for creds_file in "$CF_CONFIG_DIR/${TUNNEL_ID}.json" "$CF_CONFIG_DIR"/*.json; do
+            if [ -f "$creds_file" ]; then
+                sudo cp "$creds_file" /etc/cloudflared/ 2>/dev/null
+            fi
+        done
+    fi
+    
+    # Copy cert if exists
+    sudo cp "$CF_CONFIG_DIR/cert.pem" /etc/cloudflared/ 2>/dev/null || true
+    
+    # Check if service exists
+    if ! systemctl list-unit-files | grep -q "cloudflared.service"; then
+        log "INFO" "Cloudflared service not installed, installing now..."
+        install_service
+        return $?
+    fi
+    
+    # Service exists - restart it to pick up new config
+    log "INFO" "Restarting cloudflared service..."
+    sudo systemctl daemon-reload
+    sudo systemctl restart cloudflared
+    
+    sleep 3
+    
+    if sudo systemctl is-active --quiet cloudflared; then
+        log "INFO" "Cloudflared service is running"
+        sudo systemctl status cloudflared --no-pager | head -8
+        return 0
+    else
+        log "ERROR" "Service failed to start"
+        sudo journalctl -u cloudflared -n 10 --no-pager
+        return 1
+    fi
+}
+
+#===============================================================================
 # TEST CONNECTION
 #===============================================================================
 
@@ -1537,7 +1656,8 @@ test_connection() {
 #===============================================================================
 
 add_another_service() {
-    if confirm "Add another domain/service to this tunnel?"; then
+    # Loop to add more services
+    while confirm "Add another domain/service to this tunnel?"; do
         # Reset variables for new service
         SUBDOMAINS=()
         SKIP_ROOT_DNS=""
@@ -1556,16 +1676,12 @@ add_another_service() {
         # Setup DNS via API
         setup_dns_routing
         
-        # Validate and restart
+        # Validate and ensure service is running
         validate_config
-        sudo cp "$CF_CONFIG_FILE" /etc/cloudflared/config.yml
-        sudo systemctl restart cloudflared
+        ensure_service_running
         
         log "INFO" "Service added and tunnel restarted"
-        
-        # Recursive call
-        add_another_service
-    fi
+    done
 }
 
 #===============================================================================
@@ -1705,9 +1821,24 @@ add_domain_only() {
     
     log "INFO" "Using tunnel: $TUNNEL_NAME ($TUNNEL_ID)"
     
+    # Configure the new service
     configure_service
     
-    # Add to config
+    # Save configuration immediately
+    generate_config
+    
+    # Setup DNS records via API
+    setup_dns_routing
+    
+    # Validate configuration
+    validate_config
+    
+    # Ensure service is running (auto-install if needed, restart if exists)
+    ensure_service_running
+    
+    log "INFO" "Domain configured successfully!"
+    
+    # Optionally add more domains
     add_another_service
 }
 
@@ -2100,7 +2231,7 @@ auto_debug() {
     # CHECK 1: cloudflared binary
     #---------------------------------------------------------------------------
     : $((total_checks++))
-    echo -e "${CYAN}[1/13] Checking cloudflared installation...${NC}"
+    echo -e "${CYAN}[1/14] Checking cloudflared installation...${NC}"
     if command_exists cloudflared; then
         local cf_version=$(cloudflared --version 2>/dev/null | head -1)
         echo -e "   ${GREEN}✓ PASS${NC} - cloudflared installed ($cf_version)"
@@ -2535,7 +2666,7 @@ EOCFG
     # CHECK 10: DNS Records and Ingress Rules for configured hostnames
     #---------------------------------------------------------------------------
     : $((total_checks++))
-    echo -e "${CYAN}[10/13] Verifying DNS records for configured hostnames...${NC}"
+    echo -e "${CYAN}[10/14] Verifying DNS records for configured hostnames...${NC}"
     
     # Only run if we have API token and tunnel ID
     if [ -n "$CF_API_TOKEN" ] && [ -n "$TUNNEL_ID" ]; then
@@ -2696,10 +2827,106 @@ EOCFG
     fi
     
     #---------------------------------------------------------------------------
+    # CHECK 10.6: Protocol detection - Check for HTTP/HTTPS mismatches
+    # Detects: ERR_TOO_MANY_REDIRECTS, SSL mismatches
+    #---------------------------------------------------------------------------
+    echo -e "${CYAN}[10.6/14] Checking service protocols (redirect loop detection)...${NC}"
+    
+    local config_file="/etc/cloudflared/config.yml"
+    [ ! -f "$config_file" ] && config_file="$CF_CONFIG_FILE"
+    
+    if [ -f "$config_file" ]; then
+        local protocol_issues=0
+        local protocol_fixed=0
+        
+        # Extract all service URLs from config
+        local services=$(grep -E "^\s*service:" "$config_file" 2>/dev/null | awk '{print $2}' | grep -v "http_status")
+        
+        while read -r service_url; do
+            [ -z "$service_url" ] && continue
+            
+            # Extract protocol, IP, and port
+            local proto=$(echo "$service_url" | sed -E 's|^([a-z]+)://.*|\1|')
+            local host_port=$(echo "$service_url" | sed -E 's|^[a-z]+://||')
+            local ip=$(echo "$host_port" | cut -d: -f1)
+            local port=$(echo "$host_port" | cut -d: -f2)
+            
+            # Skip non-HTTP services
+            [[ "$proto" != "http" && "$proto" != "https" ]] && continue
+            
+            # Check if service is using HTTP but should use HTTPS
+            if [ "$proto" = "http" ]; then
+                # Test if port responds to HTTPS
+                local is_https=false
+                
+                # Check common HTTPS admin ports
+                case "$port" in
+                    8006|8443|9443|443) is_https=true ;;
+                esac
+                
+                # Try SSL connection test if netcat/openssl available
+                if [ "$is_https" = false ] && command_exists timeout; then
+                    if timeout 2 bash -c "echo | openssl s_client -connect ${ip}:${port} 2>/dev/null | grep -q 'CONNECTED'" 2>/dev/null; then
+                        is_https=true
+                    fi
+                fi
+                
+                if [ "$is_https" = true ]; then
+                    echo -e "   ${YELLOW}⚠${NC} $service_url likely needs HTTPS (detected SSL on port $port)"
+                    : $((protocol_issues++))
+                    
+                    # Auto-fix: Update config to use HTTPS with noTLSVerify
+                    echo -e "   ${YELLOW}→ AUTO-FIX:${NC} Updating to https://${ip}:${port}"
+                    
+                    # Escape special characters for sed
+                    local old_service="service: $service_url"
+                    local new_service="service: https://${ip}:${port}"
+                    
+                    # Update service URL
+                    sudo sed -i "s|$old_service|$new_service|g" "$config_file"
+                    
+                    # Check if originRequest.noTLSVerify exists for this entry
+                    # Find the line number of this service and check next lines
+                    local service_line=$(grep -n "$new_service" "$config_file" | head -1 | cut -d: -f1)
+                    if [ -n "$service_line" ]; then
+                        local next_line=$((service_line + 1))
+                        local has_origin_request=$(sed -n "${next_line}p" "$config_file" | grep -c "originRequest")
+                        
+                        if [ "$has_origin_request" -eq 0 ]; then
+                            # Add originRequest block after service line
+                            sudo sed -i "${service_line}a\\    originRequest:\n      noTLSVerify: true" "$config_file"
+                        fi
+                    fi
+                    
+                    echo -e "   ${GREEN}✓ FIXED${NC} Changed to HTTPS with noTLSVerify"
+                    : $((protocol_fixed++))
+                    : $((config_changed++))
+                fi
+            fi
+        done <<< "$services"
+        
+        if [ $protocol_issues -gt 0 ]; then
+            if [ $protocol_fixed -gt 0 ]; then
+                echo -e "   ${GREEN}✓ PASS${NC} - Fixed $protocol_fixed protocol issues"
+                : $((passed_checks++))
+                : $((auto_fixed++))
+            else
+                echo -e "   ${YELLOW}⚠ WARN${NC} - Some protocols may need manual review"
+                : $((manual_needed++))
+            fi
+        else
+            echo -e "   ${GREEN}✓ PASS${NC} - No protocol mismatches detected"
+            : $((passed_checks++))
+        fi
+    else
+        echo -e "   ${YELLOW}⊘ SKIP${NC} - No config file"
+    fi
+    
+    #---------------------------------------------------------------------------
     # CHECK 11: Systemd service installed
     #---------------------------------------------------------------------------
     : $((total_checks++))
-    echo -e "${CYAN}[11/13] Checking systemd service...${NC}"
+    echo -e "${CYAN}[11/14] Checking systemd service...${NC}"
     if systemctl list-unit-files 2>/dev/null | grep -q cloudflared; then
         echo -e "   ${GREEN}✓ PASS${NC} - Service unit file exists"
         : $((passed_checks++))
@@ -2745,7 +2972,7 @@ EOSVC
     # CHECK 12: Service enabled
     #---------------------------------------------------------------------------
     : $((total_checks++))
-    echo -e "${CYAN}[12/13] Checking service is enabled...${NC}"
+    echo -e "${CYAN}[12/14] Checking service is enabled...${NC}"
     if systemctl list-unit-files 2>/dev/null | grep -q cloudflared; then
         if sudo systemctl is-enabled --quiet cloudflared 2>/dev/null; then
             echo -e "   ${GREEN}✓ PASS${NC} - Service is enabled (auto-start on boot)"
@@ -2770,7 +2997,7 @@ EOSVC
     # CHECK 13: Service running (restart if config changed)
     #---------------------------------------------------------------------------
     : $((total_checks++))
-    echo -e "${CYAN}[13/13] Checking service is running...${NC}"
+    echo -e "${CYAN}[13/14] Checking service is running...${NC}"
     
     # If config was changed, restart service to apply changes
     if [ $config_changed -gt 0 ]; then
@@ -2817,6 +3044,106 @@ EOSVC
         else
             echo -e "   ${YELLOW}⚠ MANUAL ACTION NEEDED${NC} - Prerequisites missing"
             : $((manual_needed++))
+        fi
+    fi
+    
+    #---------------------------------------------------------------------------
+    # CHECK 14: External connectivity test (detect redirect loops, SSL errors)
+    #---------------------------------------------------------------------------
+    : $((total_checks++))
+    echo -e "${CYAN}[14/14] Testing external connectivity...${NC}"
+    
+    local config_file="/etc/cloudflared/config.yml"
+    [ ! -f "$config_file" ] && config_file="$CF_CONFIG_FILE"
+    
+    if [ -f "$config_file" ] && command_exists curl; then
+        # Get first hostname from config
+        local test_hostname=$(grep -E "^\s*-?\s*hostname:" "$config_file" 2>/dev/null | awk '{print $NF}' | head -1)
+        
+        if [ -n "$test_hostname" ]; then
+            echo -e "   Testing https://$test_hostname ..."
+            
+            # Test with curl - follow redirects, but detect redirect loops
+            local curl_output=$(curl -sS -I -L --max-redirs 5 -w "%{http_code}|%{redirect_url}|%{ssl_verify_result}" \
+                "https://$test_hostname" 2>&1 | head -30)
+            
+            local http_code=$(echo "$curl_output" | grep -oE '^HTTP/[0-9.]+ [0-9]+' | tail -1 | awk '{print $2}')
+            
+            if echo "$curl_output" | grep -qi "too many redirects\|redirect loop"; then
+                echo -e "   ${RED}✗ FAIL${NC} - Redirect loop detected (ERR_TOO_MANY_REDIRECTS)"
+                : $((failed_checks++))
+                
+                echo -e "   ${YELLOW}→ DIAGNOSIS:${NC} This usually means:"
+                echo -e "      1. Target service uses HTTPS but config says HTTP"
+                echo -e "      2. Target service redirects HTTP→HTTPS causing loop"
+                echo ""
+                echo -e "   ${YELLOW}→ AUTO-FIX:${NC} Checking service protocol..."
+                
+                # Get the service URL for this hostname
+                local service_url=$(grep -A2 "hostname: $test_hostname\$" "$config_file" 2>/dev/null | grep "service:" | awk '{print $2}' | head -1)
+                
+                if [[ "$service_url" == http://* ]]; then
+                    local new_url=$(echo "$service_url" | sed 's|^http://|https://|')
+                    echo -e "   ${YELLOW}→${NC} Changing $service_url to $new_url"
+                    
+                    sudo sed -i "s|service: $service_url|service: $new_url|g" "$config_file"
+                    
+                    # Ensure noTLSVerify is set
+                    local service_line=$(grep -n "service: $new_url" "$config_file" | head -1 | cut -d: -f1)
+                    if [ -n "$service_line" ]; then
+                        local next_line=$((service_line + 1))
+                        if ! sed -n "${next_line}p" "$config_file" | grep -q "originRequest"; then
+                            sudo sed -i "${service_line}a\\    originRequest:\n      noTLSVerify: true" "$config_file"
+                        fi
+                    fi
+                    
+                    echo -e "   ${GREEN}✓ FIXED${NC} - Changed to HTTPS with noTLSVerify"
+                    echo -e "   ${YELLOW}⚠ SERVICE RESTART REQUIRED${NC}"
+                    : $((config_changed++))
+                    : $((auto_fixed++))
+                fi
+                
+            elif echo "$curl_output" | grep -qi "ssl\|certificate\|cipher"; then
+                echo -e "   ${YELLOW}⚠ WARN${NC} - SSL/Certificate warning detected"
+                echo -e "   This may clear up after a few minutes (Cloudflare cert provisioning)"
+                : $((passed_checks++))
+                
+            elif [ "$http_code" = "200" ] || [ "$http_code" = "301" ] || [ "$http_code" = "302" ]; then
+                echo -e "   ${GREEN}✓ PASS${NC} - Site is accessible (HTTP $http_code)"
+                : $((passed_checks++))
+                
+            elif [ "$http_code" = "404" ]; then
+                echo -e "   ${YELLOW}⚠ WARN${NC} - Got 404 (may be catch-all or no content)"
+                : $((passed_checks++))
+                
+            elif [ "$http_code" = "502" ] || [ "$http_code" = "503" ]; then
+                echo -e "   ${RED}✗ FAIL${NC} - Got HTTP $http_code (tunnel or origin error)"
+                echo -e "   Check: Is target server running? Is IP correct?"
+                : $((failed_checks++))
+                : $((manual_needed++))
+            else
+                echo -e "   ${YELLOW}⊘ RESULT${NC} - HTTP $http_code (check manually if issues)"
+                : $((passed_checks++))
+            fi
+        else
+            echo -e "   ${YELLOW}⊘ SKIP${NC} - No hostname in config to test"
+        fi
+    else
+        echo -e "   ${YELLOW}⊘ SKIP${NC} - curl not available or no config"
+    fi
+    
+    #---------------------------------------------------------------------------
+    # Restart service if config changed
+    #---------------------------------------------------------------------------
+    if [ $config_changed -gt 0 ]; then
+        echo ""
+        echo -e "${YELLOW}→ Configuration was modified, restarting service...${NC}"
+        sudo systemctl daemon-reload
+        if sudo systemctl restart cloudflared 2>/dev/null; then
+            sleep 3
+            if sudo systemctl is-active --quiet cloudflared; then
+                echo -e "${GREEN}✓ Service restarted successfully${NC}"
+            fi
         fi
     fi
     
