@@ -502,8 +502,23 @@ list_existing_tunnels() {
 select_or_create_tunnel() {
     print_section "Tunnel Selection"
     
+    # Check if there's an existing tunnel configured
+    local current_tunnel_id=""
+    local current_tunnel_name=""
+    if [ -f "/etc/cloudflared/config.yml" ]; then
+        current_tunnel_id=$(grep "^tunnel:" /etc/cloudflared/config.yml 2>/dev/null | awk '{print $2}')
+    elif [ -f "$CF_CONFIG_FILE" ]; then
+        current_tunnel_id=$(grep "^tunnel:" "$CF_CONFIG_FILE" 2>/dev/null | awk '{print $2}')
+    fi
+    
     # List existing tunnels
     local tunnels=$(cloudflared tunnel list 2>/dev/null | tail -n +2 | awk '{print $1, $2}')
+    
+    if [ -n "$current_tunnel_id" ]; then
+        current_tunnel_name=$(echo "$tunnels" | grep "$current_tunnel_id" | awk '{print $2}')
+        echo -e "${GREEN}Currently configured tunnel: $current_tunnel_name ($current_tunnel_id)${NC}"
+        echo ""
+    fi
     
     if [ -n "$tunnels" ]; then
         echo -e "${CYAN}Existing tunnels:${NC}"
@@ -511,6 +526,14 @@ select_or_create_tunnel() {
         echo ""
         echo "0. Create new tunnel"
         echo ""
+        
+        # Show recommendation
+        if [ -n "$current_tunnel_id" ]; then
+            echo -e "${YELLOW}TIP: To add more domains to your existing setup, select the same tunnel.${NC}"
+            echo -e "${YELLOW}     Selecting a different tunnel will switch the service to that tunnel.${NC}"
+            echo ""
+        fi
+        
         echo -en "${CYAN}Select tunnel number (or 0 for new): ${NC}"
         read -r tunnel_choice
         
@@ -519,6 +542,28 @@ select_or_create_tunnel() {
             TUNNEL_ID=$(echo "$tunnels" | sed -n "${tunnel_choice}p" | awk '{print $1}')
             
             if [ -n "$TUNNEL_NAME" ]; then
+                # Warn if switching to a different tunnel
+                if [ -n "$current_tunnel_id" ] && [ "$current_tunnel_id" != "$TUNNEL_ID" ]; then
+                    echo ""
+                    echo -e "${YELLOW}════════════════════════════════════════════════════════════════${NC}"
+                    echo -e "${YELLOW}  WARNING: You're switching from tunnel '$current_tunnel_name'${NC}"
+                    echo -e "${YELLOW}           to tunnel '$TUNNEL_NAME'${NC}"
+                    echo -e "${YELLOW}════════════════════════════════════════════════════════════════${NC}"
+                    echo ""
+                    echo -e "${CYAN}This will:${NC}"
+                    echo "  - Create a NEW config for tunnel '$TUNNEL_NAME'"
+                    echo "  - The previous tunnel's config will be backed up"
+                    echo "  - Only ONE tunnel can run at a time with a single service"
+                    echo ""
+                    echo -e "${CYAN}If you want to run MULTIPLE tunnels simultaneously:${NC}"
+                    echo "  - You need separate systemd services for each tunnel"
+                    echo "  - Use 'Install service with token' (menu option 11) for each tunnel"
+                    echo ""
+                    if ! confirm "Continue with tunnel switch?"; then
+                        return 1
+                    fi
+                fi
+                
                 log "INFO" "Selected tunnel: $TUNNEL_NAME ($TUNNEL_ID)"
                 return 0
             fi
@@ -815,22 +860,116 @@ EOF
 generate_config() {
     print_section "Generating Configuration"
     
-    # Find credentials file
-    local creds_file=$(ls "$CF_CONFIG_DIR"/*.json 2>/dev/null | head -1)
+    # Find credentials file - MUST match the tunnel ID
+    local creds_file=""
+    
+    # First try exact match for tunnel ID
+    if [ -f "$CF_CONFIG_DIR/${TUNNEL_ID}.json" ]; then
+        creds_file="$CF_CONFIG_DIR/${TUNNEL_ID}.json"
+    elif [ -f "/etc/cloudflared/${TUNNEL_ID}.json" ]; then
+        creds_file="/etc/cloudflared/${TUNNEL_ID}.json"
+    else
+        # Search for credentials file containing this tunnel ID
+        for json_file in "$CF_CONFIG_DIR"/*.json /etc/cloudflared/*.json; do
+            if [ -f "$json_file" ] && grep -q "$TUNNEL_ID" "$json_file" 2>/dev/null; then
+                creds_file="$json_file"
+                break
+            fi
+        done
+    fi
+    
+    # If still not found, create expected path
     if [ -z "$creds_file" ]; then
         creds_file="$CF_CONFIG_DIR/${TUNNEL_ID}.json"
+        log "WARN" "Credentials file not found for tunnel $TUNNEL_ID"
+        log "INFO" "Expected: $creds_file"
+        log "INFO" "You may need to re-authenticate or create the tunnel again"
+    else
+        log "INFO" "Using credentials: $creds_file"
     fi
     
-    # Backup existing config
+    # Check if config already exists and has matching tunnel ID
+    local existing_tunnel_id=""
+    local merge_mode=false
+    
     if [ -f "$CF_CONFIG_FILE" ]; then
-        cp "$CF_CONFIG_FILE" "$CF_CONFIG_FILE.bak.$(date +%s)"
-        log "INFO" "Backed up existing config"
+        existing_tunnel_id=$(grep "^tunnel:" "$CF_CONFIG_FILE" 2>/dev/null | awk '{print $2}')
+        
+        if [ "$existing_tunnel_id" = "$TUNNEL_ID" ]; then
+            # Same tunnel - merge new ingress rules
+            log "INFO" "Existing config found for same tunnel - will MERGE new hostnames"
+            merge_mode=true
+        else
+            # Different tunnel - backup old config
+            cp "$CF_CONFIG_FILE" "$CF_CONFIG_FILE.bak.$(date +%s)"
+            log "INFO" "Backed up existing config (different tunnel)"
+        fi
     fi
     
-    # Start building config
-    log "INFO" "Building configuration..."
-    
-    cat > "$CF_CONFIG_FILE" << EOF
+    if [ "$merge_mode" = true ]; then
+        # MERGE MODE: Add new ingress rules to existing config
+        log "INFO" "Merging new hostnames into existing configuration..."
+        
+        # Create temp file with new entries
+        local temp_file=$(mktemp)
+        
+        # Copy everything except catch-all (last 2 lines typically)
+        local catch_all_line=$(grep -n "service: http_status:404" "$CF_CONFIG_FILE" | tail -1 | cut -d: -f1)
+        if [ -n "$catch_all_line" ]; then
+            head -n $((catch_all_line - 2)) "$CF_CONFIG_FILE" > "$temp_file"
+        else
+            # No catch-all found, copy whole file
+            cp "$CF_CONFIG_FILE" "$temp_file"
+        fi
+        
+        echo "" >> "$temp_file"
+        
+        # Check if hostname already exists in config
+        add_hostname_if_missing() {
+            local hostname="$1"
+            local service="$2"
+            local no_tls="$3"
+            
+            if grep -q "hostname: $hostname\$" "$CF_CONFIG_FILE" 2>/dev/null; then
+                log "INFO" "Hostname $hostname already in config - skipping"
+            else
+                echo "  # $hostname (added $(date +%Y-%m-%d))" >> "$temp_file"
+                echo "  - hostname: $hostname" >> "$temp_file"
+                echo "    service: $service" >> "$temp_file"
+                if [ "$no_tls" = "true" ]; then
+                    echo "    originRequest:" >> "$temp_file"
+                    echo "      noTLSVerify: true" >> "$temp_file"
+                fi
+                log "INFO" "Added hostname: $hostname"
+            fi
+        }
+        
+        # Add new hostnames
+        if [ "$SKIP_ROOT_DNS" != "true" ]; then
+            add_hostname_if_missing "$DOMAIN_NAME" "$SERVICE_URL" "$NO_TLS_VERIFY"
+        fi
+        add_hostname_if_missing "$WWW_DOMAIN" "$SERVICE_URL" "$NO_TLS_VERIFY"
+        
+        # Add additional subdomains
+        for sub in "${SUBDOMAINS[@]}"; do
+            if [ "$sub" != "www_auto" ]; then
+                add_hostname_if_missing "${sub}.$ROOT_DOMAIN" "$SERVICE_URL" "$NO_TLS_VERIFY"
+            fi
+        done
+        
+        # Re-add catch-all
+        echo "" >> "$temp_file"
+        echo "  # Catch-all (must be last)" >> "$temp_file"
+        echo "  - service: http_status:404" >> "$temp_file"
+        
+        # Replace config
+        mv "$temp_file" "$CF_CONFIG_FILE"
+        
+    else
+        # CREATE MODE: Build new config from scratch
+        log "INFO" "Building new configuration..."
+        
+        cat > "$CF_CONFIG_FILE" << EOF
 # Cloudflare Tunnel Configuration
 # Tunnel: $TUNNEL_NAME
 # Generated: $(date)
@@ -840,51 +979,45 @@ credentials-file: $creds_file
 
 ingress:
 EOF
-    
-    # Add services from stored list + new service
-    # First, read existing services if config exists
-    if [ -f "$CF_CONFIG_FILE.bak"* ] 2>/dev/null; then
-        log "INFO" "Importing existing services..."
-        # Parse existing ingress rules (simplified - just add new)
-    fi
-    
-    # Add new service - primary hostname
-    if [ "$SKIP_ROOT_DNS" != "true" ]; then
-        echo "  # $DOMAIN_NAME" >> "$CF_CONFIG_FILE"
-        echo "  - hostname: $DOMAIN_NAME" >> "$CF_CONFIG_FILE"
-        echo "    service: $SERVICE_URL" >> "$CF_CONFIG_FILE"
         
-        if [ "$NO_TLS_VERIFY" = "true" ]; then
-            echo "    originRequest:" >> "$CF_CONFIG_FILE"
-            echo "      noTLSVerify: true" >> "$CF_CONFIG_FILE"
-        fi
-    fi
-    
-    # Add www version of primary hostname
-    echo "  # $WWW_DOMAIN (auto-added)" >> "$CF_CONFIG_FILE"
-    echo "  - hostname: $WWW_DOMAIN" >> "$CF_CONFIG_FILE"
-    echo "    service: $SERVICE_URL" >> "$CF_CONFIG_FILE"
-    if [ "$NO_TLS_VERIFY" = "true" ]; then
-        echo "    originRequest:" >> "$CF_CONFIG_FILE"
-        echo "      noTLSVerify: true" >> "$CF_CONFIG_FILE"
-    fi
-    
-    # Add additional subdomains (skip www_auto marker)
-    for sub in "${SUBDOMAINS[@]}"; do
-        if [ "$sub" != "www_auto" ]; then
-            echo "  - hostname: ${sub}.$ROOT_DOMAIN" >> "$CF_CONFIG_FILE"
+        # Add new service - primary hostname
+        if [ "$SKIP_ROOT_DNS" != "true" ]; then
+            echo "  # $DOMAIN_NAME" >> "$CF_CONFIG_FILE"
+            echo "  - hostname: $DOMAIN_NAME" >> "$CF_CONFIG_FILE"
             echo "    service: $SERVICE_URL" >> "$CF_CONFIG_FILE"
+            
             if [ "$NO_TLS_VERIFY" = "true" ]; then
                 echo "    originRequest:" >> "$CF_CONFIG_FILE"
                 echo "      noTLSVerify: true" >> "$CF_CONFIG_FILE"
             fi
         fi
-    done
+        
+        # Add www version of primary hostname
+        echo "  # $WWW_DOMAIN (auto-added)" >> "$CF_CONFIG_FILE"
+        echo "  - hostname: $WWW_DOMAIN" >> "$CF_CONFIG_FILE"
+        echo "    service: $SERVICE_URL" >> "$CF_CONFIG_FILE"
+        if [ "$NO_TLS_VERIFY" = "true" ]; then
+            echo "    originRequest:" >> "$CF_CONFIG_FILE"
+            echo "      noTLSVerify: true" >> "$CF_CONFIG_FILE"
+        fi
     
-    # Add catch-all
-    echo "" >> "$CF_CONFIG_FILE"
-    echo "  # Catch-all (must be last)" >> "$CF_CONFIG_FILE"
-    echo "  - service: http_status:404" >> "$CF_CONFIG_FILE"
+        # Add additional subdomains (skip www_auto marker)
+        for sub in "${SUBDOMAINS[@]}"; do
+            if [ "$sub" != "www_auto" ]; then
+                echo "  - hostname: ${sub}.$ROOT_DOMAIN" >> "$CF_CONFIG_FILE"
+                echo "    service: $SERVICE_URL" >> "$CF_CONFIG_FILE"
+                if [ "$NO_TLS_VERIFY" = "true" ]; then
+                    echo "    originRequest:" >> "$CF_CONFIG_FILE"
+                    echo "      noTLSVerify: true" >> "$CF_CONFIG_FILE"
+                fi
+            fi
+        done
+    
+        # Add catch-all
+        echo "" >> "$CF_CONFIG_FILE"
+        echo "  # Catch-all (must be last)" >> "$CF_CONFIG_FILE"
+        echo "  - service: http_status:404" >> "$CF_CONFIG_FILE"
+    fi
     
     log "INFO" "Configuration saved to $CF_CONFIG_FILE"
     
@@ -1168,6 +1301,7 @@ install_service() {
             sudo cloudflared service uninstall 2>/dev/null || true
         else
             log "INFO" "Restarting service with new config..."
+            sudo cp "$CF_CONFIG_FILE" /etc/cloudflared/config.yml
             sudo systemctl restart cloudflared
             return 0
         fi
@@ -1176,15 +1310,38 @@ install_service() {
     # Copy config to system location
     sudo mkdir -p /etc/cloudflared
     sudo cp "$CF_CONFIG_FILE" /etc/cloudflared/config.yml
-    sudo cp "$CF_CONFIG_DIR"/*.json /etc/cloudflared/ 2>/dev/null || true
-    sudo cp "$CF_CONFIG_DIR/cert.pem" /etc/cloudflared/ 2>/dev/null || true
     
-    # Fix credentials-file path in system config to point to /etc/cloudflared
-    local creds_filename=$(ls "$CF_CONFIG_DIR"/*.json 2>/dev/null | head -1 | xargs basename)
-    if [ -n "$creds_filename" ]; then
-        sudo sed -i "s|credentials-file:.*|credentials-file: /etc/cloudflared/$creds_filename|g" /etc/cloudflared/config.yml
-        log "INFO" "Updated credentials path to /etc/cloudflared/$creds_filename"
+    # Copy the correct credentials file for this tunnel
+    local creds_file=""
+    local creds_filename=""
+    
+    # Find credentials file matching tunnel ID
+    if [ -f "$CF_CONFIG_DIR/${TUNNEL_ID}.json" ]; then
+        creds_file="$CF_CONFIG_DIR/${TUNNEL_ID}.json"
+        creds_filename="${TUNNEL_ID}.json"
+    else
+        # Search for credentials file containing this tunnel ID  
+        for json_file in "$CF_CONFIG_DIR"/*.json; do
+            if [ -f "$json_file" ] && grep -q "$TUNNEL_ID" "$json_file" 2>/dev/null; then
+                creds_file="$json_file"
+                creds_filename=$(basename "$json_file")
+                break
+            fi
+        done
     fi
+    
+    if [ -n "$creds_file" ] && [ -f "$creds_file" ]; then
+        sudo cp "$creds_file" /etc/cloudflared/
+        sudo sed -i "s|credentials-file:.*|credentials-file: /etc/cloudflared/$creds_filename|g" /etc/cloudflared/config.yml
+        log "INFO" "Credentials file: /etc/cloudflared/$creds_filename"
+    else
+        log "WARN" "Could not find credentials file for tunnel $TUNNEL_ID"
+        log "INFO" "Copying all credentials files..."
+        sudo cp "$CF_CONFIG_DIR"/*.json /etc/cloudflared/ 2>/dev/null || true
+    fi
+    
+    # Copy cert if exists
+    sudo cp "$CF_CONFIG_DIR/cert.pem" /etc/cloudflared/ 2>/dev/null || true
     
     # Install service
     log "INFO" "Installing cloudflared service..."
@@ -1314,48 +1471,8 @@ add_another_service() {
         
         configure_service
         
-        # Append to existing config (before catch-all)
-        local temp_file=$(mktemp)
-        head -n -2 "$CF_CONFIG_FILE" > "$temp_file"
-        
-        # Add primary hostname if not skipped
-        if [ "$SKIP_ROOT_DNS" != "true" ]; then
-            echo "  # $DOMAIN_NAME" >> "$temp_file"
-            echo "  - hostname: $DOMAIN_NAME" >> "$temp_file"
-            echo "    service: $SERVICE_URL" >> "$temp_file"
-            
-            if [ "$NO_TLS_VERIFY" = "true" ]; then
-                echo "    originRequest:" >> "$temp_file"
-                echo "      noTLSVerify: true" >> "$temp_file"
-            fi
-        fi
-        
-        # Add www version of primary hostname
-        echo "  # $WWW_DOMAIN (auto-added)" >> "$temp_file"
-        echo "  - hostname: $WWW_DOMAIN" >> "$temp_file"
-        echo "    service: $SERVICE_URL" >> "$temp_file"
-        if [ "$NO_TLS_VERIFY" = "true" ]; then
-            echo "    originRequest:" >> "$temp_file"
-            echo "      noTLSVerify: true" >> "$temp_file"
-        fi
-        
-        # Add additional subdomains (skip www_auto marker)
-        for sub in "${SUBDOMAINS[@]}"; do
-            if [ "$sub" != "www_auto" ]; then
-                echo "  - hostname: ${sub}.$ROOT_DOMAIN" >> "$temp_file"
-                echo "    service: $SERVICE_URL" >> "$temp_file"
-                if [ "$NO_TLS_VERIFY" = "true" ]; then
-                    echo "    originRequest:" >> "$temp_file"
-                    echo "      noTLSVerify: true" >> "$temp_file"
-                fi
-            fi
-        done
-        
-        echo "" >> "$temp_file"
-        echo "  # Catch-all (must be last)" >> "$temp_file"
-        echo "  - service: http_status:404" >> "$temp_file"
-        
-        mv "$temp_file" "$CF_CONFIG_FILE"
+        # Use generate_config which now handles merging
+        generate_config
         
         # Setup DNS via API
         setup_dns_routing
@@ -1418,6 +1535,14 @@ show_menu() {
     # Load existing config if available
     load_existing_config
     
+    # Show current tunnel info if available
+    if [ -n "$TUNNEL_ID" ]; then
+        echo -e "${GREEN}Current tunnel: ${TUNNEL_NAME:-$TUNNEL_ID}${NC}"
+        local hostname_count=$(grep -c "hostname:" /etc/cloudflared/config.yml 2>/dev/null || echo "0")
+        echo -e "${GREEN}Configured hostnames: $hostname_count${NC}"
+        echo ""
+    fi
+    
     echo "What would you like to do?"
     echo ""
     echo "1. Full setup (new installation)"
@@ -1431,6 +1556,7 @@ show_menu() {
     echo -e "${GREEN}9. Auto Debug (automatic check & fix everything)${NC}"
     echo "10. View tunnel logs"
     echo "11. Install service with token (auto-start on boot)"
+    echo "12. Restore from backup"
     echo "0. Exit"
     echo ""
     echo -en "${CYAN}Select option [1]: ${NC}"
@@ -1449,6 +1575,7 @@ show_menu() {
         9) auto_debug ;;
         10) view_logs ;;
         11) install_service_with_token ;;
+        12) restore_from_backup ;;
         0) exit 0 ;;
         *) full_setup ;;
     esac
@@ -1598,6 +1725,119 @@ view_config() {
     fi
     
     echo ""
+    if confirm "Return to menu?"; then
+        show_menu
+    fi
+}
+
+restore_from_backup() {
+    print_section "Restore Configuration from Backup"
+    
+    echo -e "${CYAN}Looking for backup files...${NC}"
+    echo ""
+    
+    # Find backups in both locations
+    local backups=()
+    local backup_paths=()
+    local i=1
+    
+    # Check user config backups
+    for backup in "$CF_CONFIG_DIR"/config.yml.bak.*; do
+        if [ -f "$backup" ]; then
+            local timestamp=$(echo "$backup" | grep -oE '[0-9]+$')
+            local date_str=$(date -d "@$timestamp" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$timestamp")
+            local tunnel_id=$(grep "^tunnel:" "$backup" 2>/dev/null | awk '{print $2}')
+            local hostname_count=$(grep -c "hostname:" "$backup" 2>/dev/null || echo "0")
+            
+            echo "$i. $backup"
+            echo "   Date: $date_str"
+            echo "   Tunnel ID: ${tunnel_id:-unknown}"
+            echo "   Hostnames: $hostname_count"
+            echo ""
+            
+            backup_paths+=("$backup")
+            : $((i++))
+        fi
+    done
+    
+    # Check system config backups  
+    for backup in /etc/cloudflared/config.yml.bak.*; do
+        if [ -f "$backup" ]; then
+            local timestamp=$(echo "$backup" | grep -oE '[0-9]+$')
+            local date_str=$(date -d "@$timestamp" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$timestamp")
+            local tunnel_id=$(grep "^tunnel:" "$backup" 2>/dev/null | awk '{print $2}')
+            local hostname_count=$(grep -c "hostname:" "$backup" 2>/dev/null || echo "0")
+            
+            echo "$i. $backup"
+            echo "   Date: $date_str"
+            echo "   Tunnel ID: ${tunnel_id:-unknown}"
+            echo "   Hostnames: $hostname_count"
+            echo ""
+            
+            backup_paths+=("$backup")
+            : $((i++))
+        fi
+    done
+    
+    if [ ${#backup_paths[@]} -eq 0 ]; then
+        log "WARN" "No backup files found"
+        echo ""
+        if confirm "Return to menu?"; then
+            show_menu
+        fi
+        return
+    fi
+    
+    echo ""
+    echo -en "${CYAN}Select backup to restore (or 0 to cancel): ${NC}"
+    read -r backup_choice
+    
+    if [ "$backup_choice" = "0" ] || [ -z "$backup_choice" ]; then
+        show_menu
+        return
+    fi
+    
+    local selected_backup="${backup_paths[$((backup_choice-1))]}"
+    
+    if [ -f "$selected_backup" ]; then
+        echo ""
+        echo -e "${CYAN}Preview of selected backup:${NC}"
+        cat "$selected_backup"
+        echo ""
+        
+        if confirm "Restore this configuration?"; then
+            # Backup current config before restoring
+            if [ -f "$CF_CONFIG_FILE" ]; then
+                cp "$CF_CONFIG_FILE" "$CF_CONFIG_FILE.pre-restore.$(date +%s)"
+            fi
+            
+            # Restore
+            cp "$selected_backup" "$CF_CONFIG_FILE"
+            sudo cp "$selected_backup" /etc/cloudflared/config.yml
+            
+            log "INFO" "Configuration restored from backup"
+            
+            # Fix credentials path if needed
+            local creds_file=$(grep "credentials-file:" /etc/cloudflared/config.yml | awk '{print $2}')
+            if [ -n "$creds_file" ] && [ ! -f "$creds_file" ]; then
+                # Try to find the credentials file
+                local creds_filename=$(basename "$creds_file")
+                if [ -f "/etc/cloudflared/$creds_filename" ]; then
+                    sudo sed -i "s|credentials-file:.*|credentials-file: /etc/cloudflared/$creds_filename|g" /etc/cloudflared/config.yml
+                elif [ -f "$CF_CONFIG_DIR/$creds_filename" ]; then
+                    sudo cp "$CF_CONFIG_DIR/$creds_filename" /etc/cloudflared/
+                    sudo sed -i "s|credentials-file:.*|credentials-file: /etc/cloudflared/$creds_filename|g" /etc/cloudflared/config.yml
+                fi
+            fi
+            
+            if confirm "Restart service to apply restored configuration?"; then
+                restart_service
+            fi
+        fi
+    else
+        log "ERROR" "Invalid selection"
+    fi
+    
     if confirm "Return to menu?"; then
         show_menu
     fi
