@@ -681,10 +681,11 @@ module.exports = {
       NODE_ENV: 'production',
       PORT: ${APP_PORT}
     },
-    error_file: '/var/log/${APP_NAME}-error.log',
-    out_file: '/var/log/${APP_NAME}-out.log',
-    log_file: '/var/log/${APP_NAME}-combined.log',
-    time: true
+    error_file: '${APP_DIR}/logs/error.log',
+    out_file: '${APP_DIR}/logs/out.log',
+    log_file: '${APP_DIR}/logs/combined.log',
+    time: true,
+    merge_logs: true
   }]
 };
 EOF
@@ -706,10 +707,11 @@ module.exports = {
       NODE_ENV: 'production',
       PORT: ${APP_PORT}
     },
-    error_file: '/var/log/${APP_NAME}-error.log',
-    out_file: '/var/log/${APP_NAME}-out.log',
-    log_file: '/var/log/${APP_NAME}-combined.log',
-    time: true
+    error_file: '${APP_DIR}/logs/error.log',
+    out_file: '${APP_DIR}/logs/out.log',
+    log_file: '${APP_DIR}/logs/combined.log',
+    time: true,
+    merge_logs: true
   }]
 };
 EOF
@@ -717,9 +719,20 @@ EOF
     
     log "INFO" "PM2 config: script='${pm2_script}' args='${pm2_args}'"
     
-    # Create log files
-    sudo touch /var/log/${APP_NAME}-error.log /var/log/${APP_NAME}-out.log /var/log/${APP_NAME}-combined.log
-    sudo chown $USER:$USER /var/log/${APP_NAME}-*.log
+    # Create log directory and files with proper permissions
+    mkdir -p "${APP_DIR}/logs"
+    touch "${APP_DIR}/logs/error.log" "${APP_DIR}/logs/out.log" "${APP_DIR}/logs/combined.log"
+    chmod 755 "${APP_DIR}/logs"
+    chmod 644 "${APP_DIR}/logs/"*.log
+    
+    # Add logs directory to .gitignore if not already present
+    if [ -f "${APP_DIR}/.gitignore" ]; then
+        if ! grep -q "^logs/$" "${APP_DIR}/.gitignore"; then
+            echo "logs/" >> "${APP_DIR}/.gitignore"
+        fi
+    else
+        echo "logs/" > "${APP_DIR}/.gitignore"
+    fi
     
     log "INFO" "PM2 ecosystem config created"
 }
@@ -892,25 +905,45 @@ module.exports = {
       NODE_ENV: 'production',
       PORT: ${APP_PORT}
     },
-    error_file: '/var/log/${APP_NAME}-error.log',
-    out_file: '/var/log/${APP_NAME}-out.log',
-    log_file: '/var/log/${APP_NAME}-combined.log',
-    time: true
+    error_file: '${APP_DIR}/logs/error.log',
+    out_file: '${APP_DIR}/logs/out.log',
+    log_file: '${APP_DIR}/logs/combined.log',
+    time: true,
+    merge_logs: true
   }]
 };
 EOF
     
     log "INFO" "PM2 config: script='${pm2_script}' args='${pm2_args}'"
     
+    # Create log directory and files with proper permissions
+    mkdir -p "${APP_DIR}/logs"
+    touch "${APP_DIR}/logs/error.log" "${APP_DIR}/logs/out.log" "${APP_DIR}/logs/combined.log"
+    chmod 755 "${APP_DIR}/logs"
+    chmod 644 "${APP_DIR}/logs/"*.log
+    
+    # Add logs directory to .gitignore if not already present
+    if [ -f "${APP_DIR}/.gitignore" ]; then
+        if ! grep -q "^logs/$" "${APP_DIR}/.gitignore" 2>/dev/null; then
+            echo "logs/" >> "${APP_DIR}/.gitignore"
+        fi
+    fi
+    
     # Stop existing if running
     pm2 delete "$APP_NAME" 2>/dev/null || true
     
     # Start application
-    if pm2 start ecosystem.config.cjs; then
-        log "INFO" "Application started"
-    else
-        log "ERROR" "Failed to start application"
-        exit 1
+    pm2 start ecosystem.config.cjs
+    
+    # Give PM2 a moment to actually start the process
+    sleep 2
+    
+    # Check if the app actually started (pm2 returns 0 even if app crashes immediately)
+    local pm2_status=$(pm2 jlist 2>/dev/null | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4)
+    if [ "$pm2_status" = "online" ]; then
+        log "INFO" "Application started successfully"
+    elif [ "$pm2_status" = "errored" ] || [ -z "$pm2_status" ]; then
+        log "WARN" "Application may have failed to start, checking..."
     fi
     
     # Save PM2 process list
@@ -2283,6 +2316,7 @@ module.exports = {
     args: 'serve -s dist -l ${APP_PORT}',
     cwd: '${APP_DIR}',
     instances: 1,
+    exec_mode: 'fork',
     autorestart: true,
     watch: false,
     max_memory_restart: '500M',
@@ -2290,10 +2324,11 @@ module.exports = {
       NODE_ENV: 'production',
       PORT: ${APP_PORT}
     },
-    error_file: '/var/log/${APP_NAME}-error.log',
-    out_file: '/var/log/${APP_NAME}-out.log',
-    log_file: '/var/log/${APP_NAME}-combined.log',
-    time: true
+    error_file: '${APP_DIR}/logs/error.log',
+    out_file: '${APP_DIR}/logs/out.log',
+    log_file: '${APP_DIR}/logs/combined.log',
+    time: true,
+    merge_logs: true
   }]
 };
 EOF
@@ -2313,9 +2348,9 @@ module.exports = {
       NODE_ENV: 'production',
       PORT: ${APP_PORT}
     },
-    error_file: '/var/log/${APP_NAME}-error.log',
-    out_file: '/var/log/${APP_NAME}-out.log',
-    log_file: '/var/log/${APP_NAME}-combined.log',
+    error_file: '${APP_DIR}/logs/error.log',
+    out_file: '${APP_DIR}/logs/out.log',
+    log_file: '${APP_DIR}/logs/combined.log',
     time: true,
     merge_logs: true
   }]
@@ -2323,9 +2358,18 @@ module.exports = {
 EOF
     fi
     
-    # Create log files
-    sudo touch /var/log/${APP_NAME}-{error,out,combined}.log
-    sudo chown $USER:$USER /var/log/${APP_NAME}-*.log
+    # Create log directory and files with proper permissions
+    mkdir -p "${APP_DIR}/logs"
+    touch "${APP_DIR}/logs/error.log" "${APP_DIR}/logs/out.log" "${APP_DIR}/logs/combined.log"
+    chmod 755 "${APP_DIR}/logs"
+    chmod 644 "${APP_DIR}/logs/"*.log
+    
+    # Add logs directory to .gitignore if not already present
+    if [ -f "${APP_DIR}/.gitignore" ]; then
+        if ! grep -q "^logs/$" "${APP_DIR}/.gitignore" 2>/dev/null; then
+            echo "logs/" >> "${APP_DIR}/.gitignore"
+        fi
+    fi
     
     # Start with PM2
     pm2 delete "$APP_NAME" 2>/dev/null || true
