@@ -542,6 +542,85 @@ select_or_create_tunnel() {
             TUNNEL_ID=$(echo "$tunnels" | sed -n "${tunnel_choice}p" | awk '{print $1}')
             
             if [ -n "$TUNNEL_NAME" ]; then
+                # Check if credentials file exists for this tunnel
+                local creds_exists=false
+                if [ -f "$CF_CONFIG_DIR/${TUNNEL_ID}.json" ]; then
+                    creds_exists=true
+                elif [ -f "/etc/cloudflared/${TUNNEL_ID}.json" ]; then
+                    creds_exists=true
+                else
+                    # Search for credentials file containing this tunnel ID
+                    for json_file in "$CF_CONFIG_DIR"/*.json /etc/cloudflared/*.json; do
+                        if [ -f "$json_file" ] && grep -q "$TUNNEL_ID" "$json_file" 2>/dev/null; then
+                            creds_exists=true
+                            break
+                        fi
+                    done
+                fi
+                
+                if [ "$creds_exists" = false ]; then
+                    echo ""
+                    echo -e "${RED}════════════════════════════════════════════════════════════════${NC}"
+                    echo -e "${RED}  ERROR: No credentials file found for tunnel '$TUNNEL_NAME'${NC}"
+                    echo -e "${RED}════════════════════════════════════════════════════════════════${NC}"
+                    echo ""
+                    echo -e "${YELLOW}This tunnel was likely created on a different machine or via${NC}"
+                    echo -e "${YELLOW}the Cloudflare Dashboard. The credentials file is required${NC}"
+                    echo -e "${YELLOW}to run the tunnel locally.${NC}"
+                    echo ""
+                    echo -e "${CYAN}Options:${NC}"
+                    echo "  1. Use token-based installation (recommended)"
+                    echo "     - Get token from Cloudflare Dashboard → Networks → Tunnels"
+                    echo "     - Select your tunnel → Configure → Copy token"
+                    echo "     - Use menu option 11 to install with token"
+                    echo ""
+                    echo "  2. Delete this tunnel and create a new one"
+                    echo "     - This will create a new tunnel with local credentials"
+                    echo ""
+                    echo "  3. Select a different tunnel"
+                    echo ""
+                    echo -en "${CYAN}Choose option [1]: ${NC}"
+                    read -r creds_choice
+                    creds_choice=${creds_choice:-1}
+                    
+                    case "$creds_choice" in
+                        1)
+                            echo ""
+                            log "INFO" "Redirecting to token-based installation..."
+                            USE_TOKEN_INSTALL=true
+                            return 0
+                            ;;
+                        2)
+                            echo ""
+                            if confirm "Delete tunnel '$TUNNEL_NAME' and create a new one with the same name?"; then
+                                log "INFO" "Deleting tunnel: $TUNNEL_NAME"
+                                if cloudflared tunnel delete "$TUNNEL_NAME" 2>/dev/null || cloudflared tunnel delete "$TUNNEL_ID" 2>/dev/null; then
+                                    log "INFO" "Tunnel deleted, creating new one..."
+                                    if cloudflared tunnel create "$TUNNEL_NAME"; then
+                                        TUNNEL_ID=$(cloudflared tunnel list | grep "$TUNNEL_NAME" | awk '{print $1}')
+                                        log "INFO" "Tunnel recreated: $TUNNEL_NAME ($TUNNEL_ID)"
+                                        return 0
+                                    else
+                                        log "ERROR" "Failed to create tunnel"
+                                        return 1
+                                    fi
+                                else
+                                    log "ERROR" "Failed to delete tunnel (may have active connections)"
+                                    log "INFO" "Try using token-based installation instead"
+                                    return 1
+                                fi
+                            else
+                                return 1
+                            fi
+                            ;;
+                        3|*)
+                            # Re-run tunnel selection
+                            select_or_create_tunnel
+                            return $?
+                            ;;
+                    esac
+                fi
+                
                 # Warn if switching to a different tunnel
                 if [ -n "$current_tunnel_id" ] && [ "$current_tunnel_id" != "$TUNNEL_ID" ]; then
                     echo ""
@@ -1582,11 +1661,24 @@ show_menu() {
 }
 
 full_setup() {
+    # Reset token install flag
+    USE_TOKEN_INSTALL=false
+    
     check_dependencies
     install_cloudflared
     authenticate_cloudflare
     setup_api_token
     select_or_create_tunnel
+    
+    # Check if we should redirect to token-based installation
+    if [ "$USE_TOKEN_INSTALL" = true ]; then
+        echo ""
+        log "INFO" "Switching to token-based installation..."
+        echo ""
+        install_service_with_token
+        return 0
+    fi
+    
     configure_service
     generate_config
     validate_config
