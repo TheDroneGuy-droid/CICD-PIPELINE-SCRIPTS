@@ -638,6 +638,32 @@ setup_pm2() {
     esac
     
     # Create ecosystem config
+    # CRITICAL: npm/npx scripts MUST use fork mode
+    # Cluster mode only works with direct node scripts (.js files)
+    local exec_mode="fork"
+    local use_cluster="false"
+    
+    # Only allow cluster mode for direct node script execution (not npm/npx)
+    if [ -n "$pm2_interpreter" ] && [ "$IS_SSR" != "true" ]; then
+        # Direct node scripts for static content CAN use cluster mode
+        exec_mode="cluster"
+        use_cluster="true"
+    fi
+    
+    # Also force fork mode for SSR frameworks regardless of interpreter
+    case "$PROJECT_TYPE" in
+        nextjs|nuxt|remix|express)
+            exec_mode="fork"
+            pm2_instances=1
+            use_cluster="false"
+            ;;
+    esac
+    
+    # If still using fork mode, set instances to 1
+    if [ "$use_cluster" != "true" ]; then
+        pm2_instances=1
+    fi
+    
     if [ -n "$pm2_interpreter" ]; then
         # Node script directly
         cat > "$APP_DIR/ecosystem.config.cjs" << EOF
@@ -647,7 +673,7 @@ module.exports = {
     script: '${pm2_script}',
     cwd: '${APP_DIR}',
     instances: ${pm2_instances},
-    exec_mode: 'cluster',
+    exec_mode: '${exec_mode}',
     autorestart: true,
     watch: false,
     max_memory_restart: '500M',
@@ -672,7 +698,7 @@ module.exports = {
     args: '${pm2_args}',
     cwd: '${APP_DIR}',
     instances: ${pm2_instances},
-    exec_mode: 'cluster',
+    exec_mode: '${exec_mode}',
     autorestart: true,
     watch: false,
     max_memory_restart: '500M',
@@ -812,17 +838,42 @@ start_pm2() {
     
     local pm2_script=""
     local pm2_args=""
+    local exec_mode="cluster"
+    local pm2_instances="max"
     
-    if [ "$IS_SSR" = "true" ] || [ -z "$BUILD_OUTPUT_DIR" ]; then
+    # Determine if this is an SSR/server app that needs fork mode
+    # SSR apps (npm start) MUST use fork mode - cluster mode only works with node scripts
+    local use_fork_mode="false"
+    
+    # Check explicit conditions for fork mode
+    if [ "$IS_SSR" = "true" ]; then
+        use_fork_mode="true"
+    fi
+    
+    # Also check project type - certain frameworks always need fork mode
+    case "$PROJECT_TYPE" in
+        nextjs|nuxt|remix|express)
+            use_fork_mode="true"
+            ;;
+    esac
+    
+    if [ "$use_fork_mode" = "true" ] || [ -z "$BUILD_OUTPUT_DIR" ]; then
         # SSR apps or apps without build output - use npm start
         pm2_script="npm"
         pm2_args="start"
-        log "INFO" "Using npm start (SSR/Dynamic server)"
+        # CRITICAL: npm/npx scripts MUST use fork mode, not cluster
+        # Cluster mode only works with direct node scripts
+        exec_mode="fork"
+        pm2_instances=1
+        log "INFO" "Using npm start (SSR/Dynamic server) with fork mode"
     else
         # Static builds - use serve
         pm2_script="npx"
         pm2_args="serve -s ${BUILD_OUTPUT_DIR} -l ${APP_PORT}"
-        log "INFO" "Using serve for static build: ${BUILD_OUTPUT_DIR}"
+        # npx also needs fork mode for same reason
+        exec_mode="fork"
+        pm2_instances=1
+        log "INFO" "Using serve for static build: ${BUILD_OUTPUT_DIR} with fork mode"
     fi
     
     cat > "$APP_DIR/ecosystem.config.cjs" << EOF
@@ -832,8 +883,8 @@ module.exports = {
     script: '${pm2_script}',
     args: '${pm2_args}',
     cwd: '${APP_DIR}',
-    instances: 1,
-    exec_mode: 'cluster',
+    instances: ${pm2_instances},
+    exec_mode: '${exec_mode}',
     autorestart: true,
     watch: false,
     max_memory_restart: '500M',
@@ -1135,6 +1186,26 @@ EOF
     else
         log "WARN" "Webhook service may not be running"
         log "INFO" "Check status: sudo systemctl status webhook"
+    fi
+    
+    # Configure firewall (UFW)
+    if command -v ufw >/dev/null 2>&1; then
+        local ufw_status=$(sudo ufw status 2>/dev/null)
+        
+        if echo "$ufw_status" | grep -q "Status: inactive"; then
+            log "INFO" "Enabling UFW firewall..."
+            # Always allow SSH first to prevent lockout
+            sudo ufw allow ssh 2>/dev/null || sudo ufw allow 22/tcp 2>/dev/null
+            sudo ufw allow ${APP_PORT}/tcp 2>/dev/null
+            sudo ufw allow ${WEBHOOK_PORT}/tcp 2>/dev/null
+            sudo ufw --force enable 2>/dev/null
+            log "INFO" "UFW enabled with SSH, app port ${APP_PORT}, and webhook port ${WEBHOOK_PORT} allowed"
+        else
+            # UFW is active, just add the ports
+            sudo ufw allow ${APP_PORT}/tcp 2>/dev/null
+            sudo ufw allow ${WEBHOOK_PORT}/tcp 2>/dev/null
+            log "INFO" "Firewall rules added for ports ${APP_PORT} and ${WEBHOOK_PORT}"
+        fi
     fi
     
     # Create deploy log

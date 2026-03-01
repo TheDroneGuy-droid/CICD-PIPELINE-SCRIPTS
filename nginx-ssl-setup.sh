@@ -304,7 +304,7 @@ server {
 server {
     listen 80;
     listen [::]:80;
-    server_name $DOMAIN_NAME;
+    server_name $DOMAIN_NAME $SERVER_IP localhost;
 
     # Security headers
     add_header X-Frame-Options "SAMEORIGIN" always;
@@ -497,7 +497,7 @@ server {
 server {
     listen 443 ssl http2;
     listen [::]:443 ssl http2;
-    server_name $DOMAIN_NAME;
+    server_name $DOMAIN_NAME $SERVER_IP localhost;
 
     ssl_certificate /etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/$DOMAIN_NAME/privkey.pem;
@@ -622,7 +622,7 @@ server {
 server {
     listen 443 ssl http2;
     listen [::]:443 ssl http2;
-    server_name $DOMAIN_NAME;
+    server_name $DOMAIN_NAME $SERVER_IP localhost;
 
     # SSL configuration
     ssl_certificate /etc/nginx/ssl/$APP_NAME.crt;
@@ -952,15 +952,33 @@ fix_nginx_config() {
     # 7. Check firewall
     echo -e "${CYAN}7. Checking firewall...${NC}"
     if command_exists ufw; then
-        if sudo ufw status | grep -q "80\|443"; then
-            echo -e "   ${GREEN}✓ Firewall allows HTTP/HTTPS${NC}"
+        local ufw_status=$(sudo ufw status 2>/dev/null)
+        
+        # Check if UFW is inactive
+        if echo "$ufw_status" | grep -q "Status: inactive"; then
+            echo -e "   ${YELLOW}⚠ UFW firewall is inactive${NC}"
+            ((issues_found++))
+            if confirm "   Enable UFW firewall? (SSH will be allowed first)"; then
+                # Always allow SSH first to prevent lockout
+                sudo ufw allow ssh 2>/dev/null || sudo ufw allow 22/tcp 2>/dev/null
+                sudo ufw allow 'Nginx Full' 2>/dev/null || {
+                    sudo ufw allow 80/tcp 2>/dev/null
+                    sudo ufw allow 443/tcp 2>/dev/null
+                }
+                # Enable UFW
+                sudo ufw --force enable
+                echo -e "   ${GREEN}✓ UFW enabled with SSH and HTTP/HTTPS allowed${NC}"
+                ((issues_fixed++))
+            fi
+        elif echo "$ufw_status" | grep -qE "80|443|Nginx"; then
+            echo -e "   ${GREEN}✓ Firewall active and allows HTTP/HTTPS${NC}"
         else
-            echo -e "   ${YELLOW}⚠ Firewall may be blocking HTTP/HTTPS${NC}"
+            echo -e "   ${YELLOW}⚠ Firewall active but may be blocking HTTP/HTTPS${NC}"
             ((issues_found++))
             if confirm "   Allow HTTP/HTTPS in firewall?"; then
-                sudo ufw allow 'Nginx Full' || {
-                    sudo ufw allow 80/tcp
-                    sudo ufw allow 443/tcp
+                sudo ufw allow 'Nginx Full' 2>/dev/null || {
+                    sudo ufw allow 80/tcp 2>/dev/null
+                    sudo ufw allow 443/tcp 2>/dev/null
                 }
                 ((issues_fixed++))
             fi
@@ -1341,8 +1359,25 @@ EOCFG
     ((total_checks++))
     echo -e "${CYAN}[8/10] Checking firewall...${NC}"
     if command_exists ufw; then
-        if sudo ufw status 2>/dev/null | grep -qE "80|443|Nginx"; then
-            echo -e "   ${GREEN}✓ PASS${NC} - Firewall allows HTTP/HTTPS"
+        local ufw_status=$(sudo ufw status 2>/dev/null)
+        
+        # Check if UFW is inactive
+        if echo "$ufw_status" | grep -q "Status: inactive"; then
+            echo -e "   ${YELLOW}⚠ WARN${NC} - UFW firewall is inactive"
+            ((failed_checks++))
+            echo -e "   ${YELLOW}→ AUTO-FIX: Enabling UFW with SSH and HTTP/HTTPS...${NC}"
+            # Always allow SSH first to prevent lockout
+            sudo ufw allow ssh 2>/dev/null || sudo ufw allow 22/tcp 2>/dev/null
+            sudo ufw allow 'Nginx Full' 2>/dev/null || {
+                sudo ufw allow 80/tcp 2>/dev/null
+                sudo ufw allow 443/tcp 2>/dev/null
+            }
+            # Enable UFW
+            sudo ufw --force enable 2>/dev/null
+            echo -e "   ${GREEN}✓ FIXED${NC} - UFW enabled with SSH and HTTP/HTTPS allowed"
+            ((auto_fixed++))
+        elif echo "$ufw_status" | grep -qE "80|443|Nginx"; then
+            echo -e "   ${GREEN}✓ PASS${NC} - Firewall active and allows HTTP/HTTPS"
             ((passed_checks++))
         else
             echo -e "   ${YELLOW}⚠ WARN${NC} - HTTP/HTTPS may be blocked"
