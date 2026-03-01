@@ -85,6 +85,251 @@ retry_command() {
 }
 
 #===============================================================================
+# PROJECT TYPE DETECTION
+#===============================================================================
+
+# Project type globals (set by detect_project_type)
+PROJECT_TYPE=""           # nextjs, vite, cra, static, express, unknown
+BUILD_OUTPUT_DIR=""       # .next, dist, build, out
+START_COMMAND=""          # npm start, npx serve -s dist, etc.
+IS_SSR="false"            # Server-side rendering (needs npm start)
+
+detect_project_type() {
+    local app_dir="$1"
+    
+    log "INFO" "Detecting project type..."
+    
+    # Check if package.json exists
+    if [ ! -f "$app_dir/package.json" ]; then
+        log "WARN" "No package.json found - assuming static site"
+        PROJECT_TYPE="static"
+        BUILD_OUTPUT_DIR="."
+        START_COMMAND="npx serve -s . -l ${APP_PORT}"
+        IS_SSR="false"
+        return 0
+    fi
+    
+    # Read package.json dependencies
+    local pkg_content=$(cat "$app_dir/package.json" 2>/dev/null)
+    
+    # Detect Next.js
+    if echo "$pkg_content" | grep -q '"next"'; then
+        PROJECT_TYPE="nextjs"
+        BUILD_OUTPUT_DIR=".next"
+        IS_SSR="true"
+        
+        # Check if it's static export (output: 'export' in next.config.js)
+        if [ -f "$app_dir/next.config.js" ] || [ -f "$app_dir/next.config.mjs" ] || [ -f "$app_dir/next.config.ts" ]; then
+            if grep -q "output.*export" "$app_dir"/next.config.* 2>/dev/null; then
+                BUILD_OUTPUT_DIR="out"
+                IS_SSR="false"
+                START_COMMAND="npx serve -s out -l ${APP_PORT}"
+                log "INFO" "Detected: Next.js (Static Export)"
+            else
+                START_COMMAND="npm start"
+                log "INFO" "Detected: Next.js (SSR/SSG)"
+            fi
+        else
+            START_COMMAND="npm start"
+            log "INFO" "Detected: Next.js (SSR/SSG)"
+        fi
+        return 0
+    fi
+    
+    # Detect Vite
+    if echo "$pkg_content" | grep -q '"vite"'; then
+        PROJECT_TYPE="vite"
+        BUILD_OUTPUT_DIR="dist"
+        IS_SSR="false"
+        START_COMMAND="npx serve -s dist -l ${APP_PORT}"
+        log "INFO" "Detected: Vite"
+        return 0
+    fi
+    
+    # Detect Create React App
+    if echo "$pkg_content" | grep -q '"react-scripts"'; then
+        PROJECT_TYPE="cra"
+        BUILD_OUTPUT_DIR="build"
+        IS_SSR="false"
+        START_COMMAND="npx serve -s build -l ${APP_PORT}"
+        log "INFO" "Detected: Create React App"
+        return 0
+    fi
+    
+    # Detect Vue CLI
+    if echo "$pkg_content" | grep -q '"@vue/cli-service"'; then
+        PROJECT_TYPE="vue-cli"
+        BUILD_OUTPUT_DIR="dist"
+        IS_SSR="false"
+        START_COMMAND="npx serve -s dist -l ${APP_PORT}"
+        log "INFO" "Detected: Vue CLI"
+        return 0
+    fi
+    
+    # Detect Nuxt
+    if echo "$pkg_content" | grep -q '"nuxt"'; then
+        PROJECT_TYPE="nuxt"
+        BUILD_OUTPUT_DIR=".nuxt"
+        IS_SSR="true"
+        START_COMMAND="npm start"
+        log "INFO" "Detected: Nuxt.js"
+        return 0
+    fi
+    
+    # Detect Express/Node backend
+    if echo "$pkg_content" | grep -q '"express"'; then
+        PROJECT_TYPE="express"
+        BUILD_OUTPUT_DIR=""
+        IS_SSR="true"
+        # Check for common entry points
+        if [ -f "$app_dir/dist/index.js" ]; then
+            START_COMMAND="node dist/index.js"
+            BUILD_OUTPUT_DIR="dist"
+        elif [ -f "$app_dir/build/index.js" ]; then
+            START_COMMAND="node build/index.js"
+            BUILD_OUTPUT_DIR="build"
+        elif [ -f "$app_dir/index.js" ]; then
+            START_COMMAND="node index.js"
+        elif [ -f "$app_dir/server.js" ]; then
+            START_COMMAND="node server.js"
+        elif [ -f "$app_dir/app.js" ]; then
+            START_COMMAND="node app.js"
+        else
+            START_COMMAND="npm start"
+        fi
+        log "INFO" "Detected: Express/Node.js"
+        return 0
+    fi
+    
+    # Detect Angular
+    if echo "$pkg_content" | grep -q '"@angular/core"'; then
+        PROJECT_TYPE="angular"
+        # Angular builds to dist/<project-name>
+        BUILD_OUTPUT_DIR="dist"
+        IS_SSR="false"
+        START_COMMAND="npx serve -s dist -l ${APP_PORT}"
+        log "INFO" "Detected: Angular"
+        return 0
+    fi
+    
+    # Detect Gatsby
+    if echo "$pkg_content" | grep -q '"gatsby"'; then
+        PROJECT_TYPE="gatsby"
+        BUILD_OUTPUT_DIR="public"
+        IS_SSR="false"
+        START_COMMAND="npx serve -s public -l ${APP_PORT}"
+        log "INFO" "Detected: Gatsby"
+        return 0
+    fi
+    
+    # Detect Remix
+    if echo "$pkg_content" | grep -q '"@remix-run"'; then
+        PROJECT_TYPE="remix"
+        BUILD_OUTPUT_DIR="build"
+        IS_SSR="true"
+        START_COMMAND="npm start"
+        log "INFO" "Detected: Remix"
+        return 0
+    fi
+    
+    # Detect Astro
+    if echo "$pkg_content" | grep -q '"astro"'; then
+        PROJECT_TYPE="astro"
+        BUILD_OUTPUT_DIR="dist"
+        IS_SSR="false"
+        START_COMMAND="npx serve -s dist -l ${APP_PORT}"
+        log "INFO" "Detected: Astro"
+        return 0
+    fi
+    
+    # Fallback: Check for common build scripts to guess output
+    log "WARN" "Could not auto-detect project type"
+    PROJECT_TYPE="unknown"
+    
+    # Try to detect from build script
+    if echo "$pkg_content" | grep -q '"build"'; then
+        # Check for common output directories
+        if [ -d "$app_dir/dist" ]; then
+            BUILD_OUTPUT_DIR="dist"
+        elif [ -d "$app_dir/build" ]; then
+            BUILD_OUTPUT_DIR="build"
+        elif [ -d "$app_dir/.next" ]; then
+            BUILD_OUTPUT_DIR=".next"
+        elif [ -d "$app_dir/out" ]; then
+            BUILD_OUTPUT_DIR="out"
+        elif [ -d "$app_dir/public" ]; then
+            BUILD_OUTPUT_DIR="public"
+        else
+            # Will be determined after build
+            BUILD_OUTPUT_DIR=""
+        fi
+    fi
+    
+    # Default start command
+    if [ -n "$BUILD_OUTPUT_DIR" ]; then
+        if [ "$BUILD_OUTPUT_DIR" = ".next" ]; then
+            START_COMMAND="npm start"
+            IS_SSR="true"
+        else
+            START_COMMAND="npx serve -s ${BUILD_OUTPUT_DIR} -l ${APP_PORT}"
+            IS_SSR="false"
+        fi
+    else
+        # Check if there's a start script
+        if echo "$pkg_content" | grep -q '"start"'; then
+            START_COMMAND="npm start"
+            IS_SSR="true"
+        else
+            START_COMMAND="node index.js"
+            IS_SSR="true"
+        fi
+    fi
+    
+    log "INFO" "Using fallback configuration"
+    return 0
+}
+
+# Verify build output exists
+verify_build_output() {
+    local app_dir="$1"
+    
+    # If no build output expected, skip
+    if [ -z "$BUILD_OUTPUT_DIR" ]; then
+        log "INFO" "No specific build output directory expected"
+        return 0
+    fi
+    
+    # Check if the build output directory exists
+    if [ -d "$app_dir/$BUILD_OUTPUT_DIR" ]; then
+        log "INFO" "Build output found: $BUILD_OUTPUT_DIR"
+        return 0
+    fi
+    
+    # Try to find common output directories
+    log "WARN" "Expected build output '$BUILD_OUTPUT_DIR' not found, searching..."
+    
+    for dir in ".next" "dist" "build" "out" "public"; do
+        if [ -d "$app_dir/$dir" ]; then
+            log "INFO" "Found build output in: $dir"
+            BUILD_OUTPUT_DIR="$dir"
+            
+            # Update start command
+            if [ "$dir" = ".next" ]; then
+                START_COMMAND="npm start"
+                IS_SSR="true"
+            else
+                START_COMMAND="npx serve -s ${dir} -l ${APP_PORT}"
+            fi
+            return 0
+        fi
+    done
+    
+    log "ERROR" "No build output directory found"
+    log "INFO" "Checked: .next, dist, build, out, public"
+    return 1
+}
+
+#===============================================================================
 # INPUT COLLECTION
 #===============================================================================
 
@@ -183,6 +428,17 @@ collect_inputs() {
         log "INFO" "Setup cancelled by user"
         exit 0
     fi
+    
+    # Detect project type
+    detect_project_type "$APP_DIR"
+    
+    echo ""
+    echo -e "${CYAN}Project Detection:${NC}"
+    echo -e "  Project Type:    ${GREEN}$PROJECT_TYPE${NC}"
+    echo -e "  Build Output:    ${GREEN}${BUILD_OUTPUT_DIR:-N/A}${NC}"
+    echo -e "  Start Command:   ${GREEN}$START_COMMAND${NC}"
+    echo -e "  Server-Side:     ${GREEN}$IS_SSR${NC}"
+    echo ""
 }
 
 #===============================================================================
@@ -325,16 +581,73 @@ setup_pm2() {
         sudo npm install -g serve || log "WARN" "serve install failed, will use npx"
     fi
     
+    # Create ecosystem config based on project type
+    log "INFO" "Creating PM2 ecosystem config for ${PROJECT_TYPE}..."
+    
+    # Determine script and args based on project type
+    local pm2_script=""
+    local pm2_args=""
+    local pm2_interpreter=""
+    local pm2_instances="1"
+    
+    case "$PROJECT_TYPE" in
+        nextjs|nuxt|remix)
+            # SSR apps - use npm start
+            if [ "$IS_SSR" = "true" ]; then
+                pm2_script="npm"
+                pm2_args="start"
+                pm2_interpreter=""
+            else
+                pm2_script="npx"
+                pm2_args="serve -s ${BUILD_OUTPUT_DIR:-out} -l ${APP_PORT}"
+                pm2_interpreter=""
+            fi
+            ;;
+        express)
+            # Express/Node apps
+            if echo "$START_COMMAND" | grep -q "^node"; then
+                pm2_script=$(echo "$START_COMMAND" | awk '{print $2}')
+                pm2_args=""
+                pm2_interpreter="node"
+            else
+                pm2_script="npm"
+                pm2_args="start"
+                pm2_interpreter=""
+            fi
+            ;;
+        vite|cra|vue-cli|angular|gatsby|astro|static)
+            # Static site builds - use serve
+            pm2_script="npx"
+            pm2_args="serve -s ${BUILD_OUTPUT_DIR:-dist} -l ${APP_PORT}"
+            pm2_interpreter=""
+            ;;
+        *)
+            # Unknown - try to use start command
+            if echo "$START_COMMAND" | grep -q "npm start"; then
+                pm2_script="npm"
+                pm2_args="start"
+            elif echo "$START_COMMAND" | grep -q "^node"; then
+                pm2_script=$(echo "$START_COMMAND" | awk '{print $2}')
+                pm2_args=""
+                pm2_interpreter="node"
+            else
+                pm2_script="npx"
+                pm2_args="serve -s ${BUILD_OUTPUT_DIR:-dist} -l ${APP_PORT}"
+            fi
+            ;;
+    esac
+    
     # Create ecosystem config
-    log "INFO" "Creating PM2 ecosystem config..."
-    cat > "$APP_DIR/ecosystem.config.cjs" << EOF
+    if [ -n "$pm2_interpreter" ]; then
+        # Node script directly
+        cat > "$APP_DIR/ecosystem.config.cjs" << EOF
 module.exports = {
   apps: [{
     name: '${APP_NAME}',
-    script: 'npx',
-    args: 'serve -s dist -l ${APP_PORT}',
+    script: '${pm2_script}',
     cwd: '${APP_DIR}',
-    instances: 1,
+    instances: ${pm2_instances},
+    exec_mode: 'cluster',
     autorestart: true,
     watch: false,
     max_memory_restart: '500M',
@@ -349,6 +662,34 @@ module.exports = {
   }]
 };
 EOF
+    else
+        # npm/npx command
+        cat > "$APP_DIR/ecosystem.config.cjs" << EOF
+module.exports = {
+  apps: [{
+    name: '${APP_NAME}',
+    script: '${pm2_script}',
+    args: '${pm2_args}',
+    cwd: '${APP_DIR}',
+    instances: ${pm2_instances},
+    exec_mode: 'cluster',
+    autorestart: true,
+    watch: false,
+    max_memory_restart: '500M',
+    env: {
+      NODE_ENV: 'production',
+      PORT: ${APP_PORT}
+    },
+    error_file: '/var/log/${APP_NAME}-error.log',
+    out_file: '/var/log/${APP_NAME}-out.log',
+    log_file: '/var/log/${APP_NAME}-combined.log',
+    time: true
+  }]
+};
+EOF
+    fi
+    
+    log "INFO" "PM2 config: script='${pm2_script}' args='${pm2_args}'"
     
     # Create log files
     sudo touch /var/log/${APP_NAME}-error.log /var/log/${APP_NAME}-out.log /var/log/${APP_NAME}-combined.log
@@ -376,15 +717,82 @@ build_application() {
     
     # Build
     log "INFO" "Building application..."
-    npm run build || {
-        log "ERROR" "Build failed"
-        exit 1
-    }
     
-    # Verify dist folder
-    if [ ! -d "dist" ]; then
-        log "ERROR" "dist folder not found after build"
-        exit 1
+    # Check if build script exists
+    if grep -q '"build"' package.json 2>/dev/null; then
+        npm run build || {
+            log "ERROR" "Build failed"
+            log "INFO" "Check the error messages above for details"
+            log "INFO" "You may need to fix build errors and run the script again"
+            exit 1
+        }
+    else
+        log "WARN" "No build script found in package.json"
+        log "INFO" "Skipping build step - assuming pre-built or no build required"
+    fi
+    
+    # Verify build output
+    if ! verify_build_output "$APP_DIR"; then
+        log "WARN" "Build output verification failed"
+        
+        # Additional diagnostics
+        echo ""
+        echo -e "${YELLOW}Troubleshooting:${NC}"
+        echo "  1. Check if the build command ran successfully"
+        echo "  2. Your project may use a custom output directory"
+        echo "  3. For Next.js: Check if .next folder exists"
+        echo "  4. For Vite: Check if dist folder exists"
+        echo "  5. For CRA: Check if build folder exists"
+        echo ""
+        
+        # List what's in the directory
+        echo -e "${CYAN}Current directory contents:${NC}"
+        ls -la "$APP_DIR" | head -20
+        echo ""
+        
+        # Ask user what to do
+        echo -e "${YELLOW}Options:${NC}"
+        echo "  1. Continue anyway (app may use npm start directly)"
+        echo "  2. Enter custom build output directory"
+        echo "  3. Abort and fix manually"
+        echo ""
+        echo -en "${CYAN}Select option [1]: ${NC}"
+        read -r build_choice
+        build_choice=${build_choice:-1}
+        
+        case "$build_choice" in
+            1)
+                log "INFO" "Continuing without verified build output..."
+                # For apps that use npm start directly (like Next.js)
+                if [ -z "$BUILD_OUTPUT_DIR" ] || [ ! -d "$APP_DIR/$BUILD_OUTPUT_DIR" ]; then
+                    IS_SSR="true"
+                    START_COMMAND="npm start"
+                    BUILD_OUTPUT_DIR=""
+                fi
+                ;;
+            2)
+                echo -en "${CYAN}Enter build output directory: ${NC}"
+                read -r custom_build_dir
+                if [ -d "$APP_DIR/$custom_build_dir" ]; then
+                    BUILD_OUTPUT_DIR="$custom_build_dir"
+                    if [ "$custom_build_dir" = ".next" ]; then
+                        START_COMMAND="npm start"
+                        IS_SSR="true"
+                    else
+                        START_COMMAND="npx serve -s ${custom_build_dir} -l ${APP_PORT}"
+                        IS_SSR="false"
+                    fi
+                    log "INFO" "Using custom build output: $custom_build_dir"
+                else
+                    log "ERROR" "Directory not found: $custom_build_dir"
+                    exit 1
+                fi
+                ;;
+            3|*)
+                log "INFO" "Aborting. Please fix your build configuration and try again."
+                exit 1
+                ;;
+        esac
     fi
     
     log "INFO" "Build completed successfully"
@@ -398,6 +806,50 @@ start_pm2() {
     print_section "Starting Application with PM2"
     
     cd "$APP_DIR"
+    
+    # Regenerate PM2 config with final settings (in case build step changed them)
+    log "INFO" "Updating PM2 ecosystem config with final settings..."
+    
+    local pm2_script=""
+    local pm2_args=""
+    
+    if [ "$IS_SSR" = "true" ] || [ -z "$BUILD_OUTPUT_DIR" ]; then
+        # SSR apps or apps without build output - use npm start
+        pm2_script="npm"
+        pm2_args="start"
+        log "INFO" "Using npm start (SSR/Dynamic server)"
+    else
+        # Static builds - use serve
+        pm2_script="npx"
+        pm2_args="serve -s ${BUILD_OUTPUT_DIR} -l ${APP_PORT}"
+        log "INFO" "Using serve for static build: ${BUILD_OUTPUT_DIR}"
+    fi
+    
+    cat > "$APP_DIR/ecosystem.config.cjs" << EOF
+module.exports = {
+  apps: [{
+    name: '${APP_NAME}',
+    script: '${pm2_script}',
+    args: '${pm2_args}',
+    cwd: '${APP_DIR}',
+    instances: 1,
+    exec_mode: 'cluster',
+    autorestart: true,
+    watch: false,
+    max_memory_restart: '500M',
+    env: {
+      NODE_ENV: 'production',
+      PORT: ${APP_PORT}
+    },
+    error_file: '/var/log/${APP_NAME}-error.log',
+    out_file: '/var/log/${APP_NAME}-out.log',
+    log_file: '/var/log/${APP_NAME}-combined.log',
+    time: true
+  }]
+};
+EOF
+    
+    log "INFO" "PM2 config: script='${pm2_script}' args='${pm2_args}'"
     
     # Stop existing if running
     pm2 delete "$APP_NAME" 2>/dev/null || true
@@ -424,13 +876,53 @@ start_pm2() {
     # Verify
     sleep 3
     if pm2 list | grep -q "$APP_NAME"; then
-        local status=$(pm2 jlist | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4)
+        local status=$(pm2 jlist 2>/dev/null | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4)
         if [ "$status" = "online" ]; then
             log "INFO" "Application is running"
+            echo ""
+            pm2 status
+            echo ""
+        elif [ "$status" = "errored" ]; then
+            log "ERROR" "Application failed to start!"
+            echo ""
+            echo -e "${RED}═══════════════════════════════════════════════════════════════${NC}"
+            echo -e "${RED}  APPLICATION ERROR - TROUBLESHOOTING${NC}"
+            echo -e "${RED}═══════════════════════════════════════════════════════════════${NC}"
+            echo ""
+            echo -e "${YELLOW}Recent logs:${NC}"
+            pm2 logs "$APP_NAME" --lines 20 --nostream 2>/dev/null || true
+            echo ""
+            echo -e "${YELLOW}Common causes:${NC}"
+            echo "  1. Missing start script in package.json"
+            echo "  2. Port conflict (${APP_PORT} may be in use)"
+            echo "  3. Missing environment variables"
+            echo "  4. Build errors that weren't caught"
+            echo ""
+            echo -e "${CYAN}To diagnose:${NC}"
+            echo "  pm2 logs $APP_NAME              # View logs"
+            echo "  pm2 describe $APP_NAME          # View details"
+            echo "  cat $APP_DIR/package.json       # Check scripts"
+            echo ""
+            echo -e "${CYAN}To fix manually:${NC}"
+            echo "  cd $APP_DIR"
+            echo "  npm start                       # Try running directly"
+            echo ""
+            
+            # Offer to run npm start directly to see error
+            if confirm "Try running 'npm start' directly to see error?"; then
+                echo ""
+                echo -e "${CYAN}Running: npm start${NC}"
+                echo ""
+                cd "$APP_DIR"
+                timeout 10 npm start 2>&1 || true
+                echo ""
+            fi
         else
             log "WARN" "Application status: $status"
             log "INFO" "Check logs: pm2 logs $APP_NAME"
         fi
+    else
+        log "ERROR" "Application not found in PM2"
     fi
 }
 
