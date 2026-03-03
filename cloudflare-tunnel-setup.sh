@@ -1060,50 +1060,130 @@ generate_config() {
         # MERGE MODE: Add new ingress rules to existing config
         log "INFO" "Merging new hostnames into existing configuration..."
         
-        # Create temp file with new entries
+        # Create temp file for new config
         local temp_file=$(mktemp)
+        local work_file=$(mktemp)
         
-        # Copy everything except catch-all (last 2 lines typically)
-        local catch_all_line=$(grep -n "service: http_status:404" "$CF_CONFIG_FILE" | tail -1 | cut -d: -f1)
-        if [ -n "$catch_all_line" ]; then
-            head -n $((catch_all_line - 2)) "$CF_CONFIG_FILE" > "$temp_file"
-        else
-            # No catch-all found, copy whole file
-            cp "$CF_CONFIG_FILE" "$temp_file"
-        fi
+        # Copy existing config to work file
+        cp "$CF_CONFIG_FILE" "$work_file"
         
-        echo "" >> "$temp_file"
+        # Function to remove existing hostname block from config
+        remove_hostname_block() {
+            local hostname="$1"
+            local file="$2"
+            
+            # Find the line number of the hostname
+            local host_line=$(grep -n "hostname: ${hostname}\$" "$file" | head -1 | cut -d: -f1)
+            if [ -z "$host_line" ]; then
+                return 1  # Not found
+            fi
+            
+            # Find start (comment line before hostname, or hostname line itself)
+            local start_line=$host_line
+            local prev_line=$((host_line - 1))
+            if [ $prev_line -gt 0 ]; then
+                local prev_content=$(sed -n "${prev_line}p" "$file")
+                if [[ "$prev_content" =~ ^[[:space:]]*#.*${hostname} ]] || [[ "$prev_content" =~ ^[[:space:]]*#.*added ]] || [[ "$prev_content" =~ ^[[:space:]]*#.*updated ]]; then
+                    start_line=$prev_line
+                fi
+            fi
+            
+            # Find end (service line + optional originRequest block)
+            local end_line=$((host_line + 1))  # At minimum, service line
+            local total_lines=$(wc -l < "$file")
+            
+            # Check for originRequest block
+            local service_next=$((host_line + 1))
+            local origin_check=$((host_line + 2))
+            if [ $origin_check -le $total_lines ]; then
+                local origin_content=$(sed -n "${origin_check}p" "$file")
+                if [[ "$origin_content" =~ ^[[:space:]]*originRequest: ]]; then
+                    end_line=$origin_check
+                    # Check for noTLSVerify line
+                    local tls_check=$((origin_check + 1))
+                    if [ $tls_check -le $total_lines ]; then
+                        local tls_content=$(sed -n "${tls_check}p" "$file")
+                        if [[ "$tls_content" =~ ^[[:space:]]*noTLSVerify: ]]; then
+                            end_line=$tls_check
+                        fi
+                    fi
+                fi
+            fi
+            
+            # Remove lines from start_line to end_line
+            sed -i "${start_line},${end_line}d" "$file"
+            
+            # Also remove any trailing blank lines after deletion
+            return 0
+        }
         
-        # Check if hostname already exists in config
-        add_hostname_if_missing() {
+        # Function to add or update hostname
+        add_or_update_hostname() {
             local hostname="$1"
             local service="$2"
             local no_tls="$3"
             
-            if grep -q "hostname: $hostname\$" "$CF_CONFIG_FILE" 2>/dev/null; then
-                log "INFO" "Hostname $hostname already in config - skipping"
+            if grep -q "hostname: ${hostname}\$" "$work_file" 2>/dev/null; then
+                # Hostname exists - remove old entry first
+                log "INFO" "Updating hostname: $hostname -> $service"
+                remove_hostname_block "$hostname" "$work_file"
             else
-                echo "  # $hostname (added $(date +%Y-%m-%d))" >> "$temp_file"
-                echo "  - hostname: $hostname" >> "$temp_file"
-                echo "    service: $service" >> "$temp_file"
-                if [ "$no_tls" = "true" ]; then
-                    echo "    originRequest:" >> "$temp_file"
-                    echo "      noTLSVerify: true" >> "$temp_file"
-                fi
-                log "INFO" "Added hostname: $hostname"
+                log "INFO" "Adding hostname: $hostname -> $service"
             fi
         }
         
-        # Add new hostnames
+        # Mark hostnames for update (remove old entries)
         if [ "$SKIP_ROOT_DNS" != "true" ]; then
-            add_hostname_if_missing "$DOMAIN_NAME" "$SERVICE_URL" "$NO_TLS_VERIFY"
+            add_or_update_hostname "$DOMAIN_NAME" "$SERVICE_URL" "$NO_TLS_VERIFY"
         fi
-        add_hostname_if_missing "$WWW_DOMAIN" "$SERVICE_URL" "$NO_TLS_VERIFY"
+        add_or_update_hostname "$WWW_DOMAIN" "$SERVICE_URL" "$NO_TLS_VERIFY"
         
-        # Add additional subdomains
+        # Process additional subdomains
         for sub in "${SUBDOMAINS[@]}"; do
             if [ "$sub" != "www_auto" ]; then
-                add_hostname_if_missing "${sub}.$ROOT_DOMAIN" "$SERVICE_URL" "$NO_TLS_VERIFY"
+                add_or_update_hostname "${sub}.$ROOT_DOMAIN" "$SERVICE_URL" "$NO_TLS_VERIFY"
+            fi
+        done
+        
+        # Now rebuild the config: copy work_file up to catch-all, add new entries, add catch-all
+        local catch_all_line=$(grep -n "service: http_status:404" "$work_file" | tail -1 | cut -d: -f1)
+        if [ -n "$catch_all_line" ]; then
+            # Copy everything before catch-all comment (usually 2 lines before: blank + comment)
+            local before_catchall=$((catch_all_line - 2))
+            if [ $before_catchall -lt 1 ]; then
+                before_catchall=$((catch_all_line - 1))
+            fi
+            head -n $before_catchall "$work_file" > "$temp_file"
+        else
+            # No catch-all, copy whole file
+            cp "$work_file" "$temp_file"
+        fi
+        
+        echo "" >> "$temp_file"
+        
+        # Add the new/updated entries
+        add_new_entry() {
+            local hostname="$1"
+            local service="$2"
+            local no_tls="$3"
+            
+            echo "  # $hostname (updated $(date +%Y-%m-%d))" >> "$temp_file"
+            echo "  - hostname: $hostname" >> "$temp_file"
+            echo "    service: $service" >> "$temp_file"
+            if [ "$no_tls" = "true" ]; then
+                echo "    originRequest:" >> "$temp_file"
+                echo "      noTLSVerify: true" >> "$temp_file"
+            fi
+        }
+        
+        if [ "$SKIP_ROOT_DNS" != "true" ]; then
+            add_new_entry "$DOMAIN_NAME" "$SERVICE_URL" "$NO_TLS_VERIFY"
+        fi
+        add_new_entry "$WWW_DOMAIN" "$SERVICE_URL" "$NO_TLS_VERIFY"
+        
+        for sub in "${SUBDOMAINS[@]}"; do
+            if [ "$sub" != "www_auto" ]; then
+                add_new_entry "${sub}.$ROOT_DOMAIN" "$SERVICE_URL" "$NO_TLS_VERIFY"
             fi
         done
         
@@ -1114,6 +1194,9 @@ generate_config() {
         
         # Replace config
         mv "$temp_file" "$CF_CONFIG_FILE"
+        
+        # Cleanup
+        rm -f "$work_file" 2>/dev/null
         
     else
         # CREATE MODE: Build new config from scratch
