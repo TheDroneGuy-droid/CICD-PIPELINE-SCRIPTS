@@ -99,6 +99,38 @@ check_dependencies() {
 }
 
 #===============================================================================
+# TEMP FILE CLEANUP AND ERROR HANDLING
+#===============================================================================
+
+# Array to track temp files for cleanup
+TEMP_FILES=()
+
+# Cleanup function - removes all tracked temp files
+cleanup_temp_files() {
+    for temp_file in "${TEMP_FILES[@]}"; do
+        if [ -f "$temp_file" ]; then
+            rm -f "$temp_file" 2>/dev/null
+        fi
+    done
+    TEMP_FILES=()
+}
+
+# Register temp file for cleanup tracking
+register_temp_file() {
+    TEMP_FILES+=("$1")
+}
+
+# Cleanup on script exit (normal or error)
+trap cleanup_temp_files EXIT
+
+# Create tracked temp file (automatically cleaned on exit)
+create_tracked_temp() {
+    local temp_file=$(mktemp)
+    register_temp_file "$temp_file"
+    echo "$temp_file"
+}
+
+#===============================================================================
 # CLOUDFLARE API FUNCTIONS
 #===============================================================================
 
@@ -1060,9 +1092,14 @@ generate_config() {
         # MERGE MODE: Add new ingress rules to existing config
         log "INFO" "Merging new hostnames into existing configuration..."
         
-        # Create temp file for new config
-        local temp_file=$(mktemp)
-        local work_file=$(mktemp)
+        # Create automatic backup before merge (safety net)
+        local merge_backup="$CF_CONFIG_FILE.pre-merge.$(date +%s)"
+        cp "$CF_CONFIG_FILE" "$merge_backup"
+        log "DEBUG" "Created pre-merge backup: $merge_backup"
+        
+        # Create tracked temp files (automatically cleaned on exit)
+        local temp_file=$(create_tracked_temp)
+        local work_file=$(create_tracked_temp)
         
         # Copy existing config to work file
         cp "$CF_CONFIG_FILE" "$work_file"
@@ -1192,11 +1229,15 @@ generate_config() {
         echo "  # Catch-all (must be last)" >> "$temp_file"
         echo "  - service: http_status:404" >> "$temp_file"
         
-        # Replace config
-        mv "$temp_file" "$CF_CONFIG_FILE"
+        # Replace config with error recovery
+        if ! mv "$temp_file" "$CF_CONFIG_FILE"; then
+            log "ERROR" "Failed to replace config, restoring from backup..."
+            cp "$merge_backup" "$CF_CONFIG_FILE"
+            return 1
+        fi
         
-        # Cleanup
-        rm -f "$work_file" 2>/dev/null
+        # Temp files cleaned automatically by EXIT trap
+        log "DEBUG" "Merge completed successfully"
         
     else
         # CREATE MODE: Build new config from scratch
@@ -1534,10 +1575,10 @@ install_service() {
             sudo systemctl stop cloudflared
             sudo cloudflared service uninstall 2>/dev/null || true
         else
-            log "INFO" "Restarting service with new config..."
-            sudo cp "$CF_CONFIG_FILE" /etc/cloudflared/config.yml
-            sudo systemctl restart cloudflared
-            return 0
+            log "INFO" "Updating and restarting service with new config..."
+            # Use ensure_service_running which handles credentials properly
+            ensure_service_running
+            return $?
         fi
     fi
     
@@ -1572,10 +1613,22 @@ install_service() {
         log "WARN" "Could not find credentials file for tunnel $TUNNEL_ID"
         log "INFO" "Copying all credentials files..."
         sudo cp "$CF_CONFIG_DIR"/*.json /etc/cloudflared/ 2>/dev/null || true
+        # Update credentials path to use tunnel ID filename
+        sudo sed -i "s|credentials-file:.*|credentials-file: /etc/cloudflared/${TUNNEL_ID}.json|g" /etc/cloudflared/config.yml
     fi
     
     # Copy cert if exists
     sudo cp "$CF_CONFIG_DIR/cert.pem" /etc/cloudflared/ 2>/dev/null || true
+    
+    # Validate system config before installing service
+    log "INFO" "Validating system configuration..."
+    if ! sudo cloudflared tunnel --config /etc/cloudflared/config.yml ingress validate 2>/dev/null; then
+        log "ERROR" "System configuration validation failed!"
+        log "INFO" "Showing current system config:"
+        sudo cat /etc/cloudflared/config.yml
+        return 1
+    fi
+    log "INFO" "System configuration validated"
     
     # Install service
     log "INFO" "Installing cloudflared service..."
@@ -2606,6 +2659,11 @@ auto_debug() {
         sudo mkdir -p /etc/cloudflared
         if sudo cp "$CF_CONFIG_FILE" /etc/cloudflared/config.yml; then
             sudo cp "$CF_CONFIG_DIR"/*.json /etc/cloudflared/ 2>/dev/null || true
+            # Update credentials path to system location
+            local tunnel_id=$(grep "^tunnel:" /etc/cloudflared/config.yml 2>/dev/null | awk '{print $2}')
+            if [ -n "$tunnel_id" ]; then
+                sudo sed -i "s|credentials-file:.*|credentials-file: /etc/cloudflared/${tunnel_id}.json|g" /etc/cloudflared/config.yml
+            fi
             echo -e "   ${GREEN}✓ FIXED${NC} - Config copied to /etc/cloudflared/"
             : $((auto_fixed++))
         else
@@ -2915,8 +2973,8 @@ EOCFG
                         # Find position of catch-all and insert before it
                         local catch_all_line=$(grep -n "service: http_status:404" "$config_file" | tail -1 | cut -d: -f1)
                         if [ -n "$catch_all_line" ]; then
-                            # Create temporary file with new ingress entry
-                            local tmp_file=$(mktemp)
+                            # Create tracked temporary file (auto-cleaned on exit)
+                            local tmp_file=$(create_tracked_temp)
                             head -n $((catch_all_line - 1)) "$config_file" > "$tmp_file"
                             echo "  # $www_host (auto-added)" >> "$tmp_file"
                             echo "  - hostname: $www_host" >> "$tmp_file"
@@ -3406,6 +3464,11 @@ fix_configuration() {
                 sudo mkdir -p /etc/cloudflared
                 sudo cp "$CF_CONFIG_FILE" /etc/cloudflared/config.yml
                 sudo cp "$CF_CONFIG_DIR"/*.json /etc/cloudflared/ 2>/dev/null || true
+                # Update credentials path to system location
+                local tunnel_id=$(grep "^tunnel:" /etc/cloudflared/config.yml 2>/dev/null | awk '{print $2}')
+                if [ -n "$tunnel_id" ]; then
+                    sudo sed -i "s|credentials-file:.*|credentials-file: /etc/cloudflared/${tunnel_id}.json|g" /etc/cloudflared/config.yml
+                fi
                 : $((issues_fixed++))
             fi
         else
