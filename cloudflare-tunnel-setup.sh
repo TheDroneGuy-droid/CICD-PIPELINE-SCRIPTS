@@ -1289,7 +1289,8 @@ validate_config() {
     
     log "INFO" "Validating tunnel configuration..."
     
-    if cloudflared tunnel ingress validate; then
+    # Validate user config first
+    if cloudflared tunnel --config "$CF_CONFIG_FILE" ingress validate; then
         log "INFO" "Configuration is valid"
     else
         log "ERROR" "Configuration validation failed"
@@ -1567,17 +1568,54 @@ ensure_service_running() {
     sudo mkdir -p /etc/cloudflared
     sudo cp "$CF_CONFIG_FILE" /etc/cloudflared/config.yml
     
-    # Copy credentials if they exist
+    # Extract tunnel ID from config if not set
+    if [ -z "$TUNNEL_ID" ]; then
+        TUNNEL_ID=$(grep "^tunnel:" /etc/cloudflared/config.yml 2>/dev/null | awk '{print $2}')
+    fi
+    
+    # Copy credentials if they exist and update path in config
+    local creds_filename=""
     if [ -n "$TUNNEL_ID" ]; then
-        for creds_file in "$CF_CONFIG_DIR/${TUNNEL_ID}.json" "$CF_CONFIG_DIR"/*.json; do
-            if [ -f "$creds_file" ]; then
-                sudo cp "$creds_file" /etc/cloudflared/ 2>/dev/null
-            fi
-        done
+        # First try exact tunnel ID match
+        if [ -f "$CF_CONFIG_DIR/${TUNNEL_ID}.json" ]; then
+            sudo cp "$CF_CONFIG_DIR/${TUNNEL_ID}.json" /etc/cloudflared/
+            creds_filename="${TUNNEL_ID}.json"
+        else
+            # Search for matching credentials file
+            for creds_file in "$CF_CONFIG_DIR"/*.json; do
+                if [ -f "$creds_file" ] && grep -q "$TUNNEL_ID" "$creds_file" 2>/dev/null; then
+                    sudo cp "$creds_file" /etc/cloudflared/
+                    creds_filename=$(basename "$creds_file")
+                    break
+                fi
+            done
+        fi
+        
+        # CRITICAL: Update credentials-file path in system config to point to /etc/cloudflared/
+        if [ -n "$creds_filename" ]; then
+            sudo sed -i "s|credentials-file:.*|credentials-file: /etc/cloudflared/$creds_filename|g" /etc/cloudflared/config.yml
+            log "INFO" "Updated credentials path: /etc/cloudflared/$creds_filename"
+        else
+            # Fallback: copy all credentials and update path to tunnel ID
+            sudo cp "$CF_CONFIG_DIR"/*.json /etc/cloudflared/ 2>/dev/null || true
+            # Try to update path using tunnel ID as filename
+            sudo sed -i "s|credentials-file:.*|credentials-file: /etc/cloudflared/${TUNNEL_ID}.json|g" /etc/cloudflared/config.yml
+            log "WARN" "Could not find specific credentials, copied all and set path to ${TUNNEL_ID}.json"
+        fi
     fi
     
     # Copy cert if exists
     sudo cp "$CF_CONFIG_DIR/cert.pem" /etc/cloudflared/ 2>/dev/null || true
+    
+    # Validate system config before restarting
+    log "INFO" "Validating system configuration..."
+    if ! sudo cloudflared tunnel --config /etc/cloudflared/config.yml ingress validate 2>/dev/null; then
+        log "ERROR" "System configuration validation failed!"
+        log "INFO" "Showing current system config:"
+        sudo cat /etc/cloudflared/config.yml
+        return 1
+    fi
+    log "INFO" "System configuration validated"
     
     # Check if service exists
     if ! systemctl list-unit-files | grep -q "cloudflared.service"; then
