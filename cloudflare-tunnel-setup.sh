@@ -137,6 +137,36 @@ create_tracked_temp() {
 setup_api_token() {
     print_section "Cloudflare API Token Setup"
     
+    # Check for key.txt in script directory or home directory
+    local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local key_file=""
+    
+    if [ -f "$script_dir/key.txt" ]; then
+        key_file="$script_dir/key.txt"
+    elif [ -f "$HOME/key.txt" ]; then
+        key_file="$HOME/key.txt"
+    elif [ -f "./key.txt" ]; then
+        key_file="./key.txt"
+    fi
+    
+    # Load from key.txt if found and api_token doesn't exist
+    if [ -n "$key_file" ] && [ ! -f "$API_TOKEN_FILE" ]; then
+        log "INFO" "Found key file at $key_file"
+        CF_API_TOKEN=$(cat "$key_file" | tr -d '[:space:]')
+        if verify_api_token; then
+            log "INFO" "API token from key.txt is valid"
+            # Save to standard location for future use
+            mkdir -p "$(dirname "$API_TOKEN_FILE")"
+            echo "$CF_API_TOKEN" > "$API_TOKEN_FILE"
+            chmod 600 "$API_TOKEN_FILE"
+            log "INFO" "Token saved to $API_TOKEN_FILE"
+            return 0
+        else
+            log "WARN" "Token in key.txt is invalid"
+            CF_API_TOKEN=""
+        fi
+    fi
+    
     # Check for existing token
     if [ -f "$API_TOKEN_FILE" ]; then
         CF_API_TOKEN=$(cat "$API_TOKEN_FILE")
